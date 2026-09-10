@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 """招聘 HR 工作台：数据看板（含数据管理）/ 岗位匹配（岗位信息→批量上传→DeepSeek 智能打分）。"""
+import datetime as _dt
 import hashlib
 import io
 import json
 import os
+import urllib.parse
+import urllib.request
+
 import pandas as pd
 import streamlit as st
 import plotly.express as px
@@ -39,24 +43,256 @@ def kpi_row(kpis, keys, labels, suffix=''):
         col.metric(labels[k], f'{v:g}{suffix}' if isinstance(v, (int, float)) else v)
 
 
-# ---------------- 岗位库（内置 + 用户自定义） ----------------
+# ---------------- 持久化存储层（云端数据库优先，本地文件兜底） ----------------
+# 为什么需要这一层：Streamlit 云端服务器的磁盘是临时的，应用休眠/重启后写在磁盘上的文件
+# 会被清空，而刷新页面又会开启全新会话（session_state 归零）。所以岗位库（含 JD）、被删除
+# 的内置岗位、打分记录统一存到外部数据库；没配置时自动退化为本地文件（本地运行完全够用）。
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(APP_DIR, 'data')
+KEY_FILE = os.path.join(DATA_DIR, 'deepseek_key.txt')
+LOCAL_KV_FILE = os.path.join(DATA_DIR, 'kv_store.json')
 
-def load_positions():
-    positions = []
-    for p in mt.JD_POSITIONS:
-        p2 = dict(p)
-        p2['source'] = '内置'
-        positions.append(p2)
-    if os.path.exists(POS_FILE):
+KV_TABLE = 'hr_workbench_kv'
+POS_KEY = 'positions_v1'
+DEL_KEY = 'deleted_builtins_v1'
+HIST_KEY = 'score_history_v1'
+HIST_MAX = 20
+KV_WARN = []
+
+SUPABASE_SQL = """create table if not exists hr_workbench_kv (
+  key text primary key,
+  value jsonb,
+  updated_at timestamptz default now()
+);"""
+
+
+def _secret(*names):
+    """读取配置：环境变量优先，其次 st.secrets（支持扁平键与 [supabase] 分区）。"""
+    for n in names:
+        v = os.environ.get(n)
+        if v:
+            return str(v).strip()
+    try:
+        sec = st.secrets
+    except Exception:
+        return ''
+    for n in names:
         try:
-            with open(POS_FILE, 'r', encoding='utf-8') as fp:
-                for p in json.load(fp):
-                    p2 = dict(p)
-                    p2['source'] = '自定义'
-                    positions.append(p2)
+            v = sec.get(n)
+        except Exception:
+            v = None
+        if v:
+            return str(v).strip()
+    try:
+        for section in ('supabase', 'SUPABASE', 'Supabase'):
+            if section in sec:
+                sub = sec[section]
+                for n in names:
+                    try:
+                        v = sub.get(n)
+                    except Exception:
+                        v = None
+                    if v:
+                        return str(v).strip()
+    except Exception:
+        pass
+    return ''
+
+
+def supabase_conf():
+    """返回（项目地址, 密钥）；未配置时返回空字符串。"""
+    url = _secret('SUPABASE_URL')
+    key = _secret('SUPABASE_KEY', 'SUPABASE_ANON_KEY', 'SUPABASE_SERVICE_KEY')
+    return url.rstrip('/'), key
+
+
+def cloud_enabled():
+    url, key = supabase_conf()
+    return bool(url and key)
+
+
+def _now_str():
+    return _dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _jsonable(obj):
+    """把 numpy / pandas 等类型转成可 JSON 序列化的普通类型。"""
+    if obj is None or isinstance(obj, (str, bool)):
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, int):
+        return int(obj)
+    if isinstance(obj, float):
+        return None if obj != obj or obj in (float('inf'), float('-inf')) else float(obj)
+    if hasattr(obj, 'item'):
+        try:
+            return _jsonable(obj.item())
         except Exception:
             pass
-    return positions
+    return str(obj)
+
+
+def _local_read_all():
+    try:
+        with open(LOCAL_KV_FILE, 'r', encoding='utf-8') as fp:
+            data = json.load(fp)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _local_write_all(data):
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(LOCAL_KV_FILE, 'w', encoding='utf-8') as fp:
+            json.dump(data, fp, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+
+def _http_json(method, url, headers, payload=None, timeout=20):
+    body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode('utf-8')
+    req = urllib.request.Request(url, data=body, method=method, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode('utf-8')
+    return json.loads(raw) if raw.strip() else None
+
+
+def _sb_headers(key):
+    return {'apikey': key, 'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'}
+
+
+def kv_get(key, default=None):
+    """读持久层：优先云端数据库，取不到再退回本地文件。"""
+    if cloud_enabled():
+        url, skey = supabase_conf()
+        try:
+            query = urllib.parse.urlencode({'key': f'eq.{key}', 'select': 'value'})
+            rows = _http_json('GET', f'{url}/rest/v1/{KV_TABLE}?{query}', _sb_headers(skey)) or []
+            if rows:
+                return rows[0].get('value', default)
+        except Exception as e:
+            _kv_warn(f'云端读取失败（{e}），已改用本地备份。')
+    return _local_read_all().get(key, default)
+
+
+def kv_set(key, value):
+    """写持久层：云端可用时写云端，同时本地留一份兜底。"""
+    value = _jsonable(value)
+    wrote_cloud = False
+    if cloud_enabled():
+        url, skey = supabase_conf()
+        headers = _sb_headers(skey)
+        headers['Prefer'] = 'resolution=merge-duplicates,return=minimal'
+        try:
+            _http_json('POST', f'{url}/rest/v1/{KV_TABLE}', headers,
+                       [{'key': key, 'value': value, 'updated_at': _now_str()}])
+            wrote_cloud = True
+        except Exception as e:
+            _kv_warn(f'云端保存失败（{e}），已暂存到应用本地文件。')
+    store = _local_read_all()
+    store[key] = value
+    _local_write_all(store)
+    return wrote_cloud
+
+
+def _kv_warn(msg):
+    """记录持久化告警，跨 rerun 也能提示到用户。"""
+    KV_WARN.append(msg)
+    try:
+        errs = list(st.session_state.get('kv_errors', []))
+        if msg not in errs:
+            errs.append(msg)
+        st.session_state['kv_errors'] = errs[-3:]
+    except Exception:
+        pass
+
+
+def storage_status():
+    if cloud_enabled():
+        return True, '🟢 云端数据库已连接：岗位库、JD 与打分记录会永久保存。'
+    return False, ('🟡 当前为临时存储：刷新页面不会丢，但应用休眠/重启后可能清空；'
+                   '配置好 SUPABASE_URL / SUPABASE_KEY 即可永久保存。')
+
+
+def _storage_notice():
+    ok, msg = storage_status()
+    if ok:
+        st.caption(msg)
+    else:
+        st.info(msg + '（展开页面底部的「如何开启永久保存」可查看配置步骤）')
+    for w in st.session_state.pop('kv_errors', [])[:2]:
+        st.warning(w)
+
+
+# ---------------- 岗位库（内置 + 用户自定义，均可删除） ----------------
+
+def _norm_pos(p, source=None):
+    q = dict(p)
+    q['name'] = str(q.get('name') or '未命名岗位').strip()
+    q['department'] = str(q.get('department') or '')
+    try:
+        q['education'] = int(q.get('education') or 0)
+    except Exception:
+        q['education'] = 0
+    try:
+        q['years'] = float(q.get('years') or 0)
+    except Exception:
+        q['years'] = 0.0
+    q['keywords'] = list(q.get('keywords') or [])
+    q['hard_conditions'] = list(q.get('hard_conditions') or [])
+    q['description'] = q.get('description') or ''
+    q['source'] = source or q.get('source') or '自定义'
+    return q
+
+
+def _builtin_positions():
+    return [_norm_pos(p, '内置') for p in mt.JD_POSITIONS]
+
+
+def _legacy_custom_positions():
+    """兼容旧版本：把 data/user_positions.json 里的自定义岗位迁移进持久层。"""
+    try:
+        if os.path.exists(POS_FILE):
+            with open(POS_FILE, 'r', encoding='utf-8') as fp:
+                return [_norm_pos(p, '自定义') for p in json.load(fp)]
+    except Exception:
+        pass
+    return []
+
+
+def load_positions():
+    """岗位库 = 内置岗位（可删、可恢复）+ 自定义岗位，全部来自持久层。"""
+    deleted_list = sorted(set(kv_get(DEL_KEY, []) or []))
+    st.session_state['deleted_builtins'] = deleted_list
+    deleted = set(deleted_list)
+    stored = kv_get(POS_KEY, None)
+    need_save = False
+    if isinstance(stored, list) and stored:
+        positions = [_norm_pos(p) for p in stored]
+    else:
+        positions = _builtin_positions()
+        need_save = True
+    have = {p['name'] for p in positions}
+    for p in _legacy_custom_positions():
+        if p['name'] not in have:
+            positions.append(p)
+            have.add(p['name'])
+            need_save = True
+    for p in _builtin_positions():          # 代码里新增的内置岗位自动补齐
+        if p['name'] not in have and p['name'] not in deleted:
+            positions.append(p)
+            have.add(p['name'])
+            need_save = True
+    out = [p for p in positions if not (p['source'] == '内置' and p['name'] in deleted)]
+    if len(out) != len(positions):
+        need_save = True
+    if need_save:
+        kv_set(POS_KEY, out)
+    return out
 
 
 def get_positions():
@@ -65,14 +301,50 @@ def get_positions():
     return st.session_state['positions']
 
 
-def save_user_positions(positions):
-    users = [p for p in positions if p.get('source') == '自定义']
-    try:
-        os.makedirs(os.path.dirname(POS_FILE), exist_ok=True)
-        with open(POS_FILE, 'w', encoding='utf-8') as fp:
-            json.dump(users, fp, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+def deleted_builtins():
+    return sorted(set(st.session_state.get('deleted_builtins', [])))
+
+
+def save_positions(positions, deleted=None):
+    kv_set(POS_KEY, [_norm_pos(p) for p in positions])
+    if deleted is not None:
+        st.session_state['deleted_builtins'] = sorted(set(deleted))
+        kv_set(DEL_KEY, sorted(set(deleted)))
+
+
+def load_history(force=False):
+    if force or 'score_history' not in st.session_state:
+        hist = kv_get(HIST_KEY, [])
+        st.session_state['score_history'] = hist if isinstance(hist, list) else []
+    return st.session_state['score_history']
+
+
+def save_history(hist):
+    hist = list(hist)[:HIST_MAX]
+    st.session_state['score_history'] = hist
+    kv_set(HIST_KEY, hist)
+
+
+def backup_payload():
+    return _jsonable({
+        'version': 1,
+        'exported_at': _now_str(),
+        'positions': get_positions(),
+        'deleted_builtins': deleted_builtins(),
+        'score_history': load_history(),
+    })
+
+
+def restore_payload(data):
+    """从备份 JSON 恢复岗位库与打分记录，返回（岗位数, 记录数）。"""
+    positions = [_norm_pos(p) for p in (data.get('positions') or [])]
+    deleted = [str(x) for x in (data.get('deleted_builtins') or [])]
+    hist = data.get('score_history') or []
+    save_positions(positions, deleted)
+    save_history(hist)
+    st.session_state.pop('positions', None)
+    st.session_state['positions'] = load_positions()
+    return len(st.session_state['positions']), len(hist)
 
 
 def position_options(positions):
@@ -91,9 +363,6 @@ def default_api_key():
         return st.secrets.get('DEEPSEEK_API_KEY', '')
     except Exception:
         return ''
-
-
-KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'deepseek_key.txt')
 
 
 def _saved_api_key():
@@ -337,6 +606,57 @@ def page_dashboard():
 
 # ==================== 岗位匹配：①岗位信息 → ②批量上传 → ③智能打分 ====================
 
+def _position_manage(positions):
+    """岗位库维护：删除任意岗位（内置也能删）、恢复内置岗位、备份与恢复。"""
+    labels = [f"{mt.position_label(p)}　[{p.get('source', '')}]" for p in positions]
+    c1, c2 = st.columns([3, 1])
+    sel_del = c1.selectbox('选择要删除的岗位（内置岗位同样可以删除）', ['（不删除）'] + labels, key='jd_del')
+    if c2.button('🗑️ 删除选中岗位', key='jd_del_btn'):
+        if sel_del != '（不删除）' and sel_del in labels:
+            idx = labels.index(sel_del)
+            target = positions[idx]
+            is_builtin = target.get('source') == '内置'
+            positions.pop(idx)
+            deleted = deleted_builtins()
+            if is_builtin:
+                deleted = sorted(set(deleted) | {target['name']})
+            save_positions(positions, deleted)
+            st.session_state['_reset_widgets'] = True
+            st.session_state['flash'] = (
+                f'已删除「{mt.position_label(target)}」'
+                + ('（内置岗位，可用下面的按钮恢复）' if is_builtin else '（自定义岗位，已从持久库移除）'))
+            st.rerun()
+
+    deleted = deleted_builtins()
+    if deleted:
+        st.caption(f'已删除的内置岗位：{"、".join(deleted)}')
+        if st.button('♻️ 恢复全部已删除的内置岗位', key='jd_restore'):
+            save_positions(positions, [])
+            st.session_state.pop('positions', None)
+            st.session_state['_reset_widgets'] = True
+            st.session_state['flash'] = f'已恢复 {len(deleted)} 个内置岗位。'
+            st.rerun()
+
+    with st.expander('💾 备份 / 恢复（换电脑、防误删）'):
+        st.caption('备份文件包含全部岗位（含已保存的 JD）和打分记录，换浏览器或换电脑时导入即可。')
+        b1, b2 = st.columns(2)
+        b1.download_button('⬇️ 导出备份 JSON',
+                           json.dumps(backup_payload(), ensure_ascii=False, indent=1).encode('utf-8'),
+                           file_name=f'招聘工作台备份_{_dt.datetime.now().strftime("%Y%m%d_%H%M")}.json',
+                           mime='application/json', key='bk_down')
+        up = b2.file_uploader('⬆️ 导入备份 JSON', type=['json'], key='bk_up')
+        if up is not None and b2.button('确认导入并覆盖', key='bk_apply'):
+            try:
+                data = json.loads(up.getvalue().decode('utf-8'))
+            except Exception as e:
+                st.error(f'备份文件读取失败：{e}')
+            else:
+                n_pos, n_hist = restore_payload(data)
+                st.session_state['_reset_widgets'] = True
+                st.session_state['flash'] = f'已恢复 {n_pos} 个岗位、{n_hist} 条打分记录。'
+                st.rerun()
+
+
 def _jd_manage(positions):
     """① 岗位信息：新增 / 查看岗位库。"""
     with st.expander('➕ 新增岗位（可粘贴 JD 自动解析）', expanded=False):
@@ -379,10 +699,12 @@ def _jd_manage(positions):
                     'source': '自定义',
                 }
                 positions.append(new_pos)
-                save_user_positions(positions)
+                save_positions(positions, deleted_builtins())
                 st.success(f'已保存岗位「{name.strip()}」，共 {len(positions)} 个岗位。')
 
-    st.markdown('**岗位库**（内置 5 个 + 自定义）')
+    n_builtin = sum(1 for p in positions if p.get('source') == '内置')
+    st.markdown(f'**岗位库**（内置 {n_builtin} 个 · 自定义 {len(positions) - n_builtin} 个 · '
+                f'共 {len(positions)} 个，均可删除）')
     rows = [{
         '岗位名称': p['name'], '部门': p.get('department', ''),
         '学历要求': EDU_NAME.get(p.get('education', 0), '不限'),
@@ -392,16 +714,7 @@ def _jd_manage(positions):
         '来源': p.get('source', ''),
     } for p in positions]
     st.dataframe(pd.DataFrame(rows), width='stretch', height=200, hide_index=True)
-
-    custom = [p for p in positions if p.get('source') == '自定义']
-    if custom:
-        del_names = ['（不删除）'] + [mt.position_label(p) for p in custom]
-        sel_del = st.selectbox('删除自定义岗位', del_names, key='jd_del')
-        if st.button('🗑️ 删除选中岗位', key='jd_del_btn'):
-            if sel_del != '（不删除）':
-                positions[:] = [p for p in positions if mt.position_label(p) != sel_del]
-                save_user_positions(positions)
-                st.success(f'已删除「{sel_del}」')
+    _position_manage(positions)
 
 
 def _gather_candidates():
@@ -483,15 +796,171 @@ def _do_scoring(pos, candidates, mode, api_key, base_url, model):
     return rows, details
 
 
+def _build_run(pos, mode, rows, details):
+    """把一次打分整理成可持久化的记录。"""
+    det = []
+    for c, ai, local, note in details:
+        score = ai['score'] if ai else local['total']
+        det.append({
+            'name': c.get('name') or '未识别',
+            'phone': c.get('phone') or '—',
+            'education': c.get('education_name', ''),
+            'years': c.get('years', 0),
+            'years_raw': c.get('years_raw', ''),
+            'source': c.get('source', ''),
+            'text': (c.get('text') or '')[:1500],
+            'score': score,
+            'tag': mt.score_tag(score),
+            'ai': ai or None,
+            'local': local,
+            'note': note,
+        })
+    stamp = _dt.datetime.now().strftime('%Y%m%d%H%M%S')
+    return _jsonable({
+        'id': f'{stamp}-{hashlib.md5((mt.position_label(pos) + str(len(rows))).encode("utf-8")).hexdigest()[:6]}',
+        'time': _dt.datetime.now().strftime('%Y-%m-%d %H:%M'),
+        'position': mt.position_label(pos),
+        'department': pos.get('department', ''),
+        'mode': mode,
+        'rows': rows,
+        'details': det,
+    })
+
+
+def render_run(run):
+    """渲染某一条已保存的打分记录。"""
+    rows = run.get('rows') or []
+    if not rows:
+        st.info('这条记录里没有结果。')
+        return
+    res = pd.DataFrame(rows)
+    if '匹配分' in res.columns:
+        res = res.sort_values('匹配分', ascending=False).reset_index(drop=True)
+    res.insert(0, '排名', res.index + 1)
+    st.caption(f"岗位：{run.get('position', '')} ｜ 打分方式：{run.get('mode', '')} ｜ 时间：{run.get('time', '')}")
+    st.dataframe(res, width='stretch', height=380, hide_index=True, column_config={
+        '匹配分': st.column_config.ProgressColumn('匹配分', min_value=0, max_value=100, format='%.1f'),
+        '排名': st.column_config.NumberColumn('排名'),
+    })
+    st.download_button('下载打分结果 CSV', res.to_csv(index=False).encode('utf-8-sig'),
+                       file_name=f"匹配打分结果_{run.get('position', '')}_{run.get('time', '').replace(':', '')}.csv",
+                       mime='text/csv', key=f"csv_{run.get('id')}")
+    st.markdown('**筛选建议**：匹配分 ≥ 70 建议约面 ｜ 50–69 待定 ｜ < 50 暂缓')
+
+    details = run.get('details') or []
+    if not details:
+        return
+    st.markdown('**候选人详情**')
+    for i, d in enumerate(sorted(details, key=lambda x: -(x.get('score') or 0))):
+        ai = d.get('ai')
+        local = d.get('local') or {}
+        with st.expander(f"{d.get('name') or '未识别'} · 匹配分 {d.get('score')} · {d.get('tag', '')}"):
+            if ai:
+                if ai.get('summary'):
+                    st.markdown(f"**💬 {ai['summary']}**")
+                if ai.get('strengths'):
+                    st.markdown('✅ **优势**：' + '；'.join(ai['strengths']))
+                if ai.get('gaps'):
+                    st.markdown('⚠️ **不足**：' + '；'.join(ai['gaps']))
+                if ai.get('highlights'):
+                    st.markdown('⭐ **亮点**：' + '；'.join(ai['highlights']))
+                if ai.get('suggestion'):
+                    st.markdown(f"📌 **建议**：{ai['suggestion']}")
+            elif d.get('note'):
+                st.markdown(f"⚠️ AI 分析失败（{d['note']}），已用本地规则分替代。")
+            if local:
+                st.markdown(f"**本地规则分**：学历 {local.get('edu_score', 0)}/20 ｜ "
+                            f"经验 {local.get('exp_score', 0)}/30 ｜ 技能 {local.get('skill_score', 0)}/40 ｜ "
+                            f"硬性 {local.get('hard_score', 0)}/10")
+            st.markdown(f"**简历来源**：{d.get('source', '')} ｜ **电话** {d.get('phone') or '—'} ｜ "
+                        f"**学历** {d.get('education', '')} ｜ **经验** {d.get('years_raw') or '未识别'}")
+            if d.get('text'):
+                st.text_area('简历原文（已保存 1500 字以内）', d['text'], height=160,
+                             key=f"hist_txt_{run.get('id')}_{i}", disabled=True)
+
+
+def _history_ui():
+    """打分记录：存放在持久层里，刷新或重开页面都还在。"""
+    st.markdown('#### 📌 打分结果（刷新页面、关闭浏览器后仍然保留）')
+    hist = load_history()
+    if not hist:
+        st.info('还没有打分记录。上传简历后点「🚀 开始打分」，结果会自动保存到这里。')
+        return
+
+    ids = [r.get('id') for r in hist]
+    labels = {r.get('id'): f"{r.get('time', '')} ｜ {r.get('position', '')} ｜ "
+                         f"{len(r.get('rows') or [])} 份 ｜ {r.get('mode', '')}" for r in hist}
+    want = st.session_state.get('view_run_id')
+    idx = ids.index(want) if want in ids else 0
+    sel_id = st.selectbox(f'查看哪一次打分（自动保留最近 {HIST_MAX} 次）', ids, index=idx,
+                          format_func=lambda i: labels.get(i, i))
+    st.session_state['view_run_id'] = sel_id
+    run = next((r for r in hist if r.get('id') == sel_id), hist[0])
+    render_run(run)
+
+    with st.expander('🧹 记录管理：删除记录 / 清空'):
+        c1, c2 = st.columns(2)
+        if c1.button('🗑️ 删除这条记录', key='hist_del_one'):
+            save_history([r for r in hist if r.get('id') != sel_id])
+            st.session_state.pop('view_run_id', None)
+            st.session_state['flash'] = '已删除该条打分记录。'
+            st.rerun()
+        if c2.button('🧹 清空全部打分记录', key='hist_clear'):
+            save_history([])
+            st.session_state.pop('view_run_id', None)
+            st.session_state['flash'] = '已清空全部打分记录。'
+            st.rerun()
+
+
+def _setup_help():
+    """未配置云端数据库时，给出一次性配置步骤。"""
+    if cloud_enabled():
+        return
+    with st.expander('🔧 如何开启“永久保存”（一次性设置，约 3 分钟）'):
+        st.markdown('现在的数据放在应用服务器上：刷新页面、换浏览器都不会丢，'
+                    '但应用休眠或被重启后可能清空。按下面 5 步接到免费的云端数据库后，'
+                    '岗位库、岗位 JD、打分记录就会永久保存。')
+        st.markdown('**1.** 打开 [supabase.com](https://supabase.com)，用邮箱注册并新建一个免费项目'
+                    '（Region 选 Singapore 更快）。')
+        st.markdown('**2.** 左侧 **SQL Editor** → **New query**，粘贴下面这段 SQL，点 **Run**：')
+        st.code(SUPABASE_SQL, language='sql')
+        st.markdown('**3.** 左侧 **Project Settings → API**，复制 **Project URL** 与 **anon public** key。')
+        st.markdown('**4.** 回到 share.streamlit.io 打开这个应用，进入 **Settings → Secrets**，'
+                    '粘贴下面两行后点 **Save**：')
+        st.code('SUPABASE_URL = "第 3 步复制的 Project URL"\n'
+                'SUPABASE_KEY = "第 3 步复制的 anon key"', language='toml')
+        st.markdown('**5.** 应用会自动重启。之后本页顶部提示会变成 🟢，数据即永久保存。')
+        st.caption('如果保存时报权限不足（项目开了 RLS），在 SQL Editor 里再运行：'
+                   'alter table hr_workbench_kv enable row level security;'
+                   'create policy "hr_kv_all" on hr_workbench_kv for all using (true) with check (true);')
+
+
 def page_matching():
     st.title('📄 岗位匹配：填写岗位 → 批量上传 → 智能打分')
     st.caption('一个流程走完：先维护岗位信息，再批量上传简历，最后 DeepSeek 智能分析打分排名（打分即筛选）。')
+    _storage_notice()
+
+    if st.session_state.get('_reset_widgets'):      # 删除/恢复岗位后，重置下拉框选中项
+        st.session_state['_reset_widgets'] = False
+        for k in ('match_pos', 'jd_del'):
+            st.session_state.pop(k, None)
+
+    if st.session_state.get('flash'):
+        st.success(st.session_state.pop('flash'))
 
     positions = get_positions()
+    if not positions:
+        st.warning('岗位库现在是空的：请展开「➕ 新增岗位」新建岗位，'
+                   '或点「♻️ 恢复全部已删除的内置岗位」把内置岗位找回来。')
+        return
 
     # ---------- 第 1 步：岗位信息 ----------
     st.markdown('#### ① 填写 / 选择岗位信息')
     _jd_manage(positions)
+
+    if not positions:
+        st.warning('岗位库现在是空的，请先新增岗位。')
+        return
 
     sel = st.selectbox('本次匹配的岗位', position_options(positions), key='match_pos')
     pos = find_position(positions, sel)
@@ -543,37 +1012,14 @@ def page_matching():
                 _save_api_key(api_key.strip())
             rows, details = _do_scoring(pos, candidates, mode, api_key, base_url, model)
             if rows is not None:
-                res = pd.DataFrame(rows).sort_values('匹配分', ascending=False).reset_index(drop=True)
-                res.insert(0, '排名', res.index + 1)
-                st.subheader(f'打分结果（{len(res)} 份，按匹配分排序）')
-                st.dataframe(res, width='stretch', height=380, hide_index=True, column_config={
-                    '匹配分': st.column_config.ProgressColumn('匹配分', min_value=0, max_value=100, format='%.1f'),
-                    '排名': st.column_config.NumberColumn('排名'),
-                })
-                st.download_button('下载打分结果 CSV', res.to_csv(index=False).encode('utf-8-sig'),
-                                   file_name='匹配打分结果.csv', mime='text/csv', key='match_csv')
-                st.markdown('**筛选建议**：匹配分 ≥ 70 建议约面 ｜ 50–69 待定 ｜ < 50 暂缓')
-                st.subheader('候选人详情')
-                for c, ai, local, note in sorted(details, key=lambda x: -(x[1]['score'] if x[1] else x[2]['total'])):
-                    sc = ai['score'] if ai else local['total']
-                    with st.expander(f"{c['name'] or '未识别'} · 匹配分 {sc} · {mt.score_tag(sc)}"):
-                        if ai:
-                            st.markdown(f"**💬 {ai.get('summary', '')}**")
-                            if ai.get('strengths'):
-                                st.markdown('✅ **优势**：' + '；'.join(ai['strengths']))
-                            if ai.get('gaps'):
-                                st.markdown('⚠️ **不足**：' + '；'.join(ai['gaps']))
-                            if ai.get('highlights'):
-                                st.markdown('⭐ **亮点**：' + '；'.join(ai['highlights']))
-                            if ai.get('suggestion'):
-                                st.markdown(f"📌 **建议**：{ai['suggestion']}")
-                        else:
-                            st.markdown(f'⚠️ AI 分析失败（{note}），已用本地规则分替代。')
-                        st.markdown(f"**本地规则分**：学历 {local['edu_score']}/20 ｜ 经验 {local['exp_score']}/30 ｜ "
-                                    f"技能 {local['skill_score']}/40 ｜ 硬性 {local['hard_score']}/10")
-                        st.markdown(f"**简历来源**：{c['source']} ｜ **电话** {c['phone'] or '—'} ｜ "
-                                    f"**学历** {c['education_name']} ｜ **经验** {c['years_raw'] or '未识别'}")
-                        st.text_area('简历原文', c['text'], height=160, key=f'detail_txt_{c["source"]}_{sc}')
+                run = _build_run(pos, mode, rows, details)
+                save_history([run] + [r for r in load_history() if r.get('id') != run['id']])
+                st.session_state['view_run_id'] = run['id']
+                st.session_state['flash'] = f'打分完成：{len(run["rows"])} 份简历已保存到下面的「打分记录」。'
+                st.rerun()
+
+    _history_ui()
+    _setup_help()
 
 
 # ==================== 入口 ====================
