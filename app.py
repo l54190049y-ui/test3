@@ -11,6 +11,7 @@ import urllib.request
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+import plotly.graph_objects as go
 
 import data_utils as du
 import matching as mt
@@ -21,10 +22,10 @@ st.markdown("""
 <style>
 .block-container {padding-top: 1.2rem;}
 [data-testid="stMetric"] {
-    background: #f7f9fc; border: 1px solid #e5e9f0; border-radius: 10px;
+    border: 1px solid rgba(128, 128, 128, 0.25); border-radius: 10px;
     padding: 12px 16px;
 }
-div[data-testid="stMetricLabel"] {font-size: 0.9rem; color: #5b6472;}
+div[data-testid="stMetricLabel"] {font-size: 0.9rem;}
 div[data-testid="stMetricValue"] {font-size: 1.6rem;}
 </style>
 """, unsafe_allow_html=True)
@@ -761,6 +762,7 @@ def _position_analysis(d, target_days, ratio):
             '同类中位(天)': round(base, 1) if base == base else float('nan'),
             '需求': demand_max, '简历': resumes, '面试': interviewed, 'Offer': offer, '入职': onboarded,
             '通过': passed, '离职': left, '现存': _num(r.get('current_headcount')),
+            '招聘起': r.get('start_date'), '招聘止': r.get('end_date'),
             '简历→面试%': round(r2i, 1) if r2i == r2i else float('nan'),
             '面试→通过%': round(i2p, 1) if i2p == i2p else float('nan'),
             'Offer→入职%': round(o2o, 1) if o2o == o2o else float('nan'),
@@ -867,294 +869,376 @@ def _open_positions_text(ana):
     return '、'.join(parts)
 
 
-def _flag_counts(ana):
-    """自动标注的分类统计。"""
-    risk = ana[ana['问题数'] > 0]
-    q = risk['主要问题'].fillna('')
-    return {
-        '岗位数': int(len(risk)),
-        '周期': int(q.str.contains('周期|超期', regex=True).sum()),
-        '简历转化': int(q.str.contains('简历→面试').sum()),
-        '面试通过': int(q.str.contains('面试通过率').sum()),
-        'Offer流失': int(q.str.contains('Offer 流失').sum()),
-        '未招满': int(q.str.contains('未招满').sum()),
-        '离职': int(q.str.contains('离职').sum()),
-    }
+def _open_issues(r, target_days):
+    """只给“在招岗位”做标注（已完成的岗位是结果，不进问题区）。"""
+    if str(r.get('状态', '')) != '招聘中':
+        return []
+    out = []
+    days = _num(r['周期(天)'])
+    if days == days and days > target_days:
+        out.append(f'已超目标 {days - target_days:.0f} 天')
+    res, itv = _num(r['简历'], 0), _num(r['面试'], 0)
+    if res <= 0:
+        out.append('尚未收到简历')
+    elif itv <= 0:
+        out.append(f'已收 {res:.0f} 份简历，未安排面试')
+    return out
 
 
 def _dashboard_summary(d, ana, target_days):
-    """第一屏：现状一眼看清 —— 状态灯、关键指标、在招岗位、自动标注统计。"""
+    """一、总览：关键指标 + 在招岗位进度（图 + 表）。"""
     m = _headline_metrics(d)
     dv = _delta_vs_prev(m)
-    overdue = int(((ana['状态'] == '招聘中') & (ana['周期(天)'] > target_days)).sum())
-    risk_n = int((ana['问题数'] > 0).sum())
     rate, cyc = _num(m['到位率']), _num(m['平均周期'])
-    conv, accept, retain = _num(m['转化率']), _num(m['Offer接受率']), _num(m['留存率'])
+    conv, retain = _num(m['转化率']), _num(m['留存率'])
+
+    op = ana[ana['状态'] == '招聘中'].copy()
+    op['标注'] = op.apply(lambda r: '；'.join(_open_issues(r, target_days)), axis=1)
+    overdue = int((op['标注'].str.contains('超目标', na=False)).sum())
+    flagged = int((op['标注'].str.len() > 0).sum())
 
     lv_rate = 'green' if rate == rate and rate >= 100 else ('amber' if rate == rate and rate >= 80 else 'red')
-    lv_risk = 'green' if (overdue == 0 and risk_n == 0) else ('amber' if (overdue <= 2 and risk_n <= 5) else 'red')
+    lv_open = 'green' if (overdue == 0 and flagged == 0) else ('amber' if overdue <= 2 and flagged <= 3 else 'red')
     lv_cyc = 'green' if (cyc != cyc or cyc <= target_days) else ('amber' if cyc <= target_days * 1.3 else 'red')
     lv_retain = 'green' if (retain != retain or retain >= 90) else ('amber' if retain >= 80 else 'red')
-    order = ['green', 'amber', 'red']
-    overall = max([lv_rate, lv_risk, lv_cyc, lv_retain], key=order.index)
 
     st.subheader('一、总览')
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric(f'{_health(lv_rate)} 需求到位率', _fmt_pct(rate, 0) if rate == rate else '—',
-              _delta_txt(dv, '到位', ' 人') or f"{_fmt_num(m['到位'])}/{_fmt_num(m['需求'])} 人")
-    c2.metric(f'{_health(lv_risk)} 在招岗位', f"{m['在招']} 个",
-              (f'超期 {overdue} 个 · 有标注 {risk_n} 个' if (overdue or risk_n) else '无超期、无标注'),
-              delta_color='inverse' if (overdue or risk_n) else 'off')
-    c3.metric(f'{_health(lv_cyc)} 平均招聘周期', f'{_fmt_num(cyc, 1)} 天',
-              _delta_txt(dv, '平均周期', ' 天', 1) or f'目标 {target_days:.0f} 天', delta_color='inverse')
-    c4.metric(f'{_health(lv_retain)} 入职留存率', _fmt_pct(retain, 0) if retain == retain else '—',
-              _delta_txt(dv, '留存率', ' pt', 1) or
-              (f"入职 {_fmt_num(m['入职'])} · 离职 {_fmt_num(m['离职'])} · 现存 {_fmt_num(m['现存'])}"),
-              delta_color='inverse')
+    snaps_now = _snapshots()
+    updated = snaps_now[-1].get('saved_at', '—') if snaps_now else '—'
+    st.caption(f'数据截至 {m["date"]}　·　岗位 {len(d)} 个（在招 {m["在招"]} · 完成 '
+               f"{int((d['status'] == '完成招聘').sum())} · 暂停 {int((d['status'] == '暂停').sum())}）"
+               f'　·　最近更新时间 {updated}')
 
-    st.markdown(f"**在招岗位（{m['在招']} 个）**：{_open_positions_text(ana)}")
-    fc = _flag_counts(ana)
-    if fc['岗位数']:
-        detail = '、'.join(f'{k} {v}' for k, v in fc.items() if k != '岗位数' and v)
-        st.markdown(f"**⚠️ 自动标注（{fc['岗位数']} 个岗位）**：{detail}"
-                    '　—　标注口径见本节末与「岗位全景」表的"标注"列。')
+    c1 = st.columns(4)
+    c1[0].metric(f'{_health(lv_rate)} 需求到位率', _fmt_pct(rate, 0) if rate == rate else '—',
+                 _delta_txt(dv, '到位', ' 人') or f"{_fmt_num(m['到位'])}/{_fmt_num(m['需求'])} 人")
+    c1[1].metric(f'{_health(lv_open)} 在招岗位', f"{m['在招']} 个",
+                 (f'超期 {overdue} · 待跟进 {flagged}' if flagged else '进度正常'),
+                 delta_color='inverse' if flagged else 'off')
+    c1[2].metric(f'{_health(lv_cyc)} 平均招聘周期', f'{_fmt_num(cyc, 1)} 天',
+                 _delta_txt(dv, '平均周期', ' 天', 1) or f'目标 {target_days:.0f} 天', delta_color='inverse')
+    c1[3].metric(f'{_health(lv_retain)} 入职留存率', _fmt_pct(retain, 0) if retain == retain else '—',
+                 _delta_txt(dv, '留存率', ' pt', 1) or
+                 f"入职 {_fmt_num(m['入职'])} · 离职 {_fmt_num(m['离职'])} · 现存 {_fmt_num(m['现存'])}",
+                 delta_color='inverse')
+
+    c2 = st.columns(4)
+    c2[0].metric('收到简历', f"{_fmt_num(m['简历'])} 份", f'整体转化 {_fmt_pct(conv)}', delta_color='off')
+    c2[1].metric('进入面试', _fmt_num(d['interviewed'].fillna(0).sum()),
+                 f"面试率 {_fmt_pct(_pct(d['interviewed'].sum(), m['简历']))}", delta_color='off')
+    c2[2].metric('发出 Offer', _fmt_num(d['offer'].fillna(0).sum()),
+                 f"面试通过 {_fmt_num(d['passed'].fillna(0).sum())} 人", delta_color='off')
+    c2[3].metric('入职 / 缺口', f"{_fmt_num(m['入职'])} / {_fmt_num(max(_num(m['需求']) - _num(m['到位']), 0))}",
+                 f"需求 {_fmt_num(m['需求'])} 人", delta_color='off')
+
+    st.markdown('**在招岗位进度**（灰段 = 到目标周期还剩多少天）')
+    if op.empty:
+        st.success('当前没有在招岗位。')
     else:
-        st.markdown('**✅ 自动标注**：当前没有需要标注的岗位。')
+        op = op.sort_values('周期(天)', ascending=True).copy()
+        op['距目标剩余'] = (target_days - op['周期(天)']).clip(lower=0)
+        op['颜色'] = op['标注'].apply(lambda s: '#e05c5c' if s else '#4c8bf5')
+        fig = go.Figure()
+        fig.add_trace(go.Bar(y=op['岗位'], x=op['距目标剩余'], orientation='h',
+                             name=f'距目标剩余（目标 {target_days:.0f} 天）', marker_color='#e8eef7',
+                             hoverinfo='skip'))
+        fig.add_trace(go.Bar(y=op['岗位'], x=op['周期(天)'], orientation='h', name='已招天数',
+                             marker_color=op['颜色'],
+                             text=[f"{_fmt_num(v)} 天" for v in op['周期(天)']], textposition='inside'))
+        fig.update_layout(barmode='stack', height=max(240, 46 * len(op)), margin=dict(t=10, b=10, l=10, r=10),
+                          legend=dict(orientation='h', y=1.12), xaxis_title='天',
+                          paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
+        st.plotly_chart(fig, width='stretch')
+        tab = op.copy()
+        tab['招聘起'] = pd.to_datetime(tab['招聘起'], errors='coerce').dt.date.astype(str).replace('NaT', '—')
+        tab['缺口'] = tab.apply(
+            lambda r: max(_num(r['需求'], 0) - _num(r['入职'], 0), 0) if r['需求'] == r['需求'] else float('nan'),
+            axis=1)
+        show = tab[['岗位', '部门', '招聘起', '周期(天)', '目标(天)', '需求', '缺口', '简历', '面试', '标注']]
+        show = show.rename(columns={'周期(天)': '已招天数', '目标(天)': '目标天数'})
+        st.dataframe(show, width='stretch', hide_index=True,
+                     column_config={'已招天数': st.column_config.NumberColumn('已招天数', format='%.0f'),
+                                    '目标天数': st.column_config.NumberColumn('目标天数', format='%.0f'),
+                                    '缺口': st.column_config.NumberColumn('缺口', format='%.0f')})
+        st.caption(f'在招 {len(op)} 个：超期 {overdue} 个、待跟进 {flagged} 个。'
+                   '蓝/红 = 已招天数（红=待跟进），浅灰 = 到目标周期还剩的天数。')
 
-    if overall == 'green':
-        st.success('🟢 整体健康：到位率、周期、留存都在正常区间。')
-    elif overall == 'amber':
-        st.warning(f'🟡 基本正常，但有 {risk_n} 个岗位被自动标注（见下方岗位全景表）。')
-    else:
-        st.error(f'🔴 需要关注：{risk_n} 个岗位被自动标注，其中 {overdue} 个在招岗位已超目标周期。')
 
-    st.caption(
-        f"到位 {_fmt_num(m['到位'])}/{_fmt_num(m['需求'])} 人（{_fmt_pct(rate, 0)}）｜在招 {m['在招']} 个（超期 {overdue} 个）"
-        f"｜平均周期 {_fmt_num(cyc, 1)} 天｜简历→入职 {_fmt_pct(conv)}｜Offer 接受率 {_fmt_pct(accept, 0)}"
-        f"｜入职留存率 {_fmt_pct(retain, 0)}（离职 {_fmt_num(m['离职'])} 人）"
-        f'　｜　状态灯口径：到位率 ≥100% 🟢、≥80% 🟡；在招无超期且无异常 🟢；周期 ≤{target_days:.0f} 天 🟢；'
-        '留存率 ≥90% 🟢、≥80% 🟡。')
-
-
-def _dashboard_positions(d, ana, only_risk, target_days):
-    """第二屏：岗位全景 —— 一行一个岗位，问题直接标注在这张表里。"""
-    st.subheader('二、岗位全景（问题自动标注）')
-    tab = ana.copy()
-    tab['缺口'] = tab.apply(
-        lambda r: max(_num(r['需求'], 0) - _num(r['入职'], 0), 0) if r['需求'] == r['需求'] else float('nan'), axis=1)
-    tab['留存%'] = tab.apply(
-        lambda r: round((_num(r['入职'], 0) - _num(r['离职'], 0)) / _num(r['入职'], 0) * 100, 1)
-        if _num(r['入职'], 0) > 0 else float('nan'), axis=1)
-    tab['标注'] = tab['主要问题'].fillna('')
-    if only_risk:
-        tab = tab[tab['问题数'] > 0]
-    order_key = {'招聘中': 0, '暂停': 1, '完成招聘': 2}
-    tab['_sort'] = tab['状态'].map(lambda s: order_key.get(s, 3))
-    tab = tab.sort_values(['_sort', '严重度', '周期(天)'], ascending=[True, False, False])
-
-    if tab.empty:
-        st.info('当前筛选条件下没有岗位数据。')
+def _dashboard_monthly(d):
+    """二、时间趋势：按月看新增岗位、完成岗位与完成岗位的平均周期。"""
+    st.subheader('二、时间趋势（按月）')
+    tmp = d.copy()
+    tmp['开始月'] = pd.to_datetime(tmp['start_date'], errors='coerce').dt.to_period('M')
+    tmp['结束月'] = pd.to_datetime(tmp['end_date'], errors='coerce').dt.to_period('M')
+    new = tmp.dropna(subset=['开始月']).groupby('开始月').size()
+    don = tmp.dropna(subset=['结束月'])
+    don = don[don['status'] == '完成招聘']
+    done_cnt = don.groupby('结束月').size()
+    done_cyc = don.groupby('结束月')['duration_days'].mean()
+    months = sorted(str(m) for m in (set(new.index) | set(done_cnt.index)))
+    if not months:
+        st.info('数据里没有可用的「招聘起 / 招聘止」日期，暂时画不出月度趋势。')
         return
+    hist = pd.DataFrame({'月份': months})
+    hist['新增岗位'] = hist['月份'].map({str(k): v for k, v in new.items()}).fillna(0).astype(int)
+    hist['完成岗位'] = hist['月份'].map({str(k): v for k, v in done_cnt.items()}).fillna(0).astype(int)
+    hist['完成岗位平均周期'] = hist['月份'].map({str(k): v for k, v in done_cyc.items()}).round(1)
 
-    cols = ['岗位', '部门', '类目', '状态', '需求', '入职', '缺口', '周期(天)', '简历', '面试', '通过',
-            'Offer', '离职', '现存', '留存%', '简历→面试%', '面试→通过%', 'Offer→入职%', '标注']
-    show = tab[[c for c in cols if c in tab.columns]].reset_index(drop=True)
-    for c in ('需求', '入职', '缺口', '周期(天)', '简历', '面试', '通过', 'Offer', '离职', '现存'):
-        if c in show.columns:
-            show[c] = show[c].apply(lambda v: round(_num(v), 1) if _num(v) == _num(v) else None)
-
-    def _hl(row):
-        bad = bool(str(row.get('标注', '')).strip())
-        return ['background-color: #fff2f2' if bad else '' for _ in row]
-
-    try:
-        st.dataframe(show.style.apply(_hl, axis=1), width='stretch', hide_index=True,
-                     height=min(120 + 34 * len(show), 520))
-    except Exception:
-        st.dataframe(show, width='stretch', hide_index=True, height=min(120 + 34 * len(show), 520))
-    st.caption(f'红底行 = 有自动标注。当前共 {len(tab)} 个岗位，其中 {int((tab["问题数"] > 0).sum())} 个有标注。'
-               f'　排序：在招 → 暂停 → 已完成；缺口 = 需求 − 入职；留存% = （入职 − 离职）÷ 入职。')
-
-    with st.expander('标注口径与自查方向（可选）', expanded=False):
-        st.markdown(
-            f'- **超期**：在招岗位已招天数 > 目标周期（{target_days:.0f} 天）→ 自查：简历量、面试排期、用人部门决策\n'
-            '- **周期偏长**：已完成/暂停岗位周期超过目标，或明显慢于同类岗位中位 → 自查：时间花在哪一环\n'
-            '- **简历转化低**：简历→面试 <10%（简历≥10 份）→ 自查：渠道质量、硬性条件是否过严\n'
-            '- **面试通过低**：面试通过率 <30%（面试≥5 人）→ 自查：面试标准与岗位画像是否一致\n'
-            '- **Offer 流失**：Offer→入职 <80% → 自查：薪资竞争力、Offer 到岗间隔\n'
-            '- **编制未招满 / 离职**：到位低于需求、或出现入职后离职 → 自查：需求合理性、新人融入')
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=hist['月份'], y=hist['新增岗位'], name='新增岗位（按招聘起）', marker_color='#4c8bf5'))
+    fig.add_trace(go.Bar(x=hist['月份'], y=hist['完成岗位'], name='完成岗位（按招聘止）', marker_color='#2e9e6b'))
+    fig.add_trace(go.Scatter(x=hist['月份'], y=hist['完成岗位平均周期'], name='完成岗位平均周期(天)',
+                             yaxis='y2', mode='lines+markers', line=dict(color='#e07b39', width=3)))
+    fig.update_layout(barmode='group', height=360, margin=dict(t=30, b=10, l=10, r=10),
+                      yaxis=dict(title='岗位数'), yaxis2=dict(title='天', overlaying='y', side='right'),
+                      legend=dict(orientation='h', y=1.15),
+                      paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
+    st.plotly_chart(fig, width='stretch')
+    st.dataframe(hist, width='stretch', hide_index=True)
+    st.caption('「新增岗位」按招聘起算，「完成岗位」按招聘止算；平均周期只统计完成招聘的岗位。')
 
 
 def _dashboard_progress(d, ana, target_days):
-    """第三屏：进度 —— 在招岗位的空缺风险 + 各公司/部门达成排行。"""
-    st.subheader('三、进度：谁快谁慢')
+    """三、组织结构：按公司/类目看分布，按公司看到位与缺口。"""
+    st.subheader('三、组织结构与达成')
 
-    st.markdown('**在招岗位跟踪（空缺风险）**')
-    open_pos = ana[ana['状态'] == '招聘中'].copy()
-    if open_pos.empty:
-        st.success('当前没有在招岗位。')
-    else:
-        open_pos['进度(%)'] = (open_pos['周期(天)'] / target_days * 100).clip(lower=0, upper=100)
-        open_pos['判断'] = open_pos.apply(
-            lambda r: '⚠️ 已超目标周期' if r['周期(天)'] > target_days
-            else ('注意：已慢于同类中位' if (r['同类中位(天)'] == r['同类中位(天)'] and r['周期(天)'] > r['同类中位(天)'])
-                  else '正常'), axis=1)
-        show = open_pos[['岗位', '部门', '周期(天)', '目标(天)', '进度(%)', '同类中位(天)', '需求', '入职', '判断']]
-        show = show.rename(columns={'周期(天)': '已招天数', '目标(天)': '目标天数', '同类中位(天)': '同类中位'})
-        st.dataframe(show, width='stretch', hide_index=True,
-                     column_config={
-                         '进度(%)': st.column_config.ProgressColumn('进度', min_value=0, max_value=100, format='%.0f'),
-                         '已招天数': st.column_config.NumberColumn('已招天数', format='%.0f'),
-                         '目标天数': st.column_config.NumberColumn('目标天数', format='%.0f'),
-                         '同类中位': st.column_config.NumberColumn('同类中位', format='%.0f')})
-        st.caption('进度 = 已招天数 ÷ 目标周期。超过目标周期或慢于同类中位的岗位，会出现在上面第二节的决策清单里。')
-
-    st.markdown('**各公司 / 部门达成排行**')
-    agg = d.groupby('department').agg(岗位数=('position', 'count'),
-                                      平均周期=('duration_days', 'mean')).reset_index()
-    dem = d[d['demand_max'].fillna(0) > 0].groupby('department').agg(
-        需求=('demand_max', 'sum'), 到位=('onboarded', 'sum')).reset_index()
-    agg = agg.merge(dem, on='department', how='left')
-    agg['达成率%'] = agg.apply(
-        lambda r: round(r['到位'] / r['需求'] * 100) if r['需求'] else float('nan'), axis=1)
-    agg['平均周期'] = agg['平均周期'].round(1)
-    agg['状态'] = agg['达成率%'].apply(
-        lambda v: '🟢 达成' if (v == v and v >= 100) else ('🟡 接近' if (v == v and v >= 80) else '🔴 有缺口'))
-    agg = agg.rename(columns={'department': '公司/部门'})[
-        ['公司/部门', '岗位数', '需求', '到位', '达成率%', '平均周期', '状态']]
-    st.dataframe(agg.sort_values('达成率%', ascending=False), width='stretch', hide_index=True)
-    chart = agg[agg['达成率%'] == agg['达成率%']].sort_values('达成率%')
-    if not chart.empty:
-        bar = px.bar(chart, x='达成率%', y='公司/部门', orientation='h', text='达成率%',
-                     color='达成率%', color_continuous_scale='RdYlGn', range_color=[0, max(120, chart['达成率%'].max())])
-        bar.add_vline(x=100, line_dash='dash', line_color='#888', annotation_text='100% 达成')
-        bar.update_layout(height=max(260, 34 * len(chart)), margin=dict(t=10, b=10, l=10, r=10),
-                          showlegend=False, coloraxis_showscale=False,
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        st.markdown('**各公司岗位状态分布**')
+        cnt = d.groupby(['department', 'status']).size().reset_index(name='岗位数')
+        cnt = cnt.rename(columns={'department': '公司/部门', 'status': '状态'})
+        fig = px.bar(cnt, x='公司/部门', y='岗位数', color='状态', barmode='stack', text='岗位数',
+                     color_discrete_map={s: du.status_label(s) for s in du.STATUS_ORDER})
+        fig.update_layout(height=340, margin=dict(t=10, b=10, l=10, r=10), legend=dict(orientation='h', y=1.15),
                           paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
-        st.plotly_chart(bar, width='stretch')
-    st.caption('达成率 = 该公司/部门「填了招聘需求」岗位的到位人数 ÷ 需求人数；没填需求的岗位不计入达成率。')
+        st.plotly_chart(fig, width='stretch')
+    with c2:
+        st.markdown('**招聘类目分布**')
+        cat = d['category'].fillna('未分类').value_counts()
+        pie = px.pie(values=cat.values, names=cat.index, hole=0.45)
+        pie.update_traces(textinfo='label+value')
+        pie.update_layout(height=340, margin=dict(t=10, b=10, l=10, r=10), showlegend=False,
+                          paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
+        st.plotly_chart(pie, width='stretch')
+
+    st.markdown('**各公司到位与缺口**')
+    dd = d[d['demand_max'].fillna(0) > 0]
+    if dd.empty:
+        st.info('没有岗位填写「招聘需求」，无法计算到位与缺口。')
+        return
+    agg = dd.groupby('department').agg(需求=('demand_max', 'sum'), 到位=('onboarded', 'sum')).reset_index()
+    agg['缺口'] = (agg['需求'] - agg['到位']).clip(lower=0)
+    agg['达成率%'] = (agg['到位'] / agg['需求'] * 100).round(0)
+    agg = agg.rename(columns={'department': '公司/部门'}).sort_values('达成率%', ascending=False)
+    st.dataframe(agg, width='stretch', hide_index=True)
+    bar = go.Figure()
+    bar.add_trace(go.Bar(y=agg['公司/部门'], x=agg['到位'], orientation='h', name='已到位', marker_color='#2e9e6b',
+                         text=agg['到位'], textposition='inside'))
+    bar.add_trace(go.Bar(y=agg['公司/部门'], x=agg['缺口'], orientation='h', name='缺口', marker_color='#e05c5c',
+                         text=agg['缺口'], textposition='inside'))
+    bar.update_layout(barmode='stack', height=max(260, 40 * len(agg)), margin=dict(t=10, b=10, l=10, r=10),
+                      legend=dict(orientation='h', y=1.15), xaxis_title='人数',
+                      paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
+    st.plotly_chart(bar, width='stretch')
+    st.caption('达成率 = 该公司「填了招聘需求」岗位的到位人数 ÷ 需求人数；缺口 = 需求 − 到位；没填需求的岗位不计入。')
 
 
 def _dashboard_efficiency(d, ana, target_days):
-    """第四屏：转化与留存 —— 每环转化/流失多少、入职后留下了多少。"""
-    st.subheader('四、转化与留存')
+    """四、转化漏斗（整体 + 各公司）；五、周期分析（只统计已完成岗位）。"""
+    st.subheader('四、转化漏斗')
+    base = d[d['resumes'].notna()].copy()
+    if base.empty:
+        st.info('没有岗位填写「推送方简历数」，无法计算漏斗。')
+        return
+    res = _num(base['resumes'].fillna(0).sum())
+    itv = _num(base['interviewed'].fillna(0).sum())
+    pss = _num(base['passed'].fillna(0).sum())
+    off = _num(base['offer'].fillna(0).sum())
+    onb = _num(base['onboarded'].fillna(0).sum())
     c1, c2 = st.columns([3, 2])
     with c1:
-        st.plotly_chart(du.build_funnel_fig(d), width='stretch')
-        res = _num(d['resumes'].fillna(0).sum())
-        itv = _num(d['interviewed'].fillna(0).sum())
-        off = _num(d['offer'].fillna(0).sum())
-        onb = _num(d['onboarded'].fillna(0).sum())
+        funnel = go.Figure(go.Funnel(
+            y=['收简历', '进面试', '面试通过', '发 Offer', '入职'],
+            x=[res, itv, pss, off, onb],
+            textinfo='value+percent initial',
+            marker={'color': ['#4c8bf5', '#36b37e', '#ffb020', '#ff7452', '#8f6ef0']}))
+        funnel.update_layout(margin=dict(l=10, r=10, t=20, b=10), height=340,
+                             paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
+        st.plotly_chart(funnel, width='stretch')
         st.caption(f'累计：收简历 {res:.0f} → 进面试 {itv:.0f}（{_fmt_pct(_pct(itv, res))}）'
-                   f' → 发 Offer {off:.0f}（{_fmt_pct(_pct(off, itv))}）'
-                   f' → 入职 {onb:.0f}（{_fmt_pct(_pct(onb, off))}）；整体转化 {_fmt_pct(_pct(onb, res))}。')
+                   f' → 面试通过 {pss:.0f}（{_fmt_pct(_pct(pss, itv))}）'
+                   f' → 发 Offer {off:.0f}（{_fmt_pct(_pct(off, pss))}）'
+                   f' → 入职 {onb:.0f}（{_fmt_pct(_pct(onb, off))}）；整体转化 {_fmt_pct(_pct(onb, res))}。'
+                   '口径：只统计填写了「推送方简历数」的岗位；只填了入职、没填简历/Offer 的批量入职岗位'
+                   '（例如分拣员）不计入漏斗，但仍计入总览的入职与留存。')
     with c2:
         stages = pd.DataFrame([
-            {'环节': '简历→面试', '流失率%': round(100 - _pct(itv, res), 1)},
-            {'环节': '面试→Offer', '流失率%': round(100 - _pct(off, itv), 1)},
-            {'环节': 'Offer→入职', '流失率%': round(100 - _pct(onb, off), 1)},
+            {'环节': '简历→面试', '转化率%': round(_pct(itv, res), 1)},
+            {'环节': '面试→Offer', '转化率%': round(_pct(off, itv), 1)},
+            {'环节': 'Offer→入职', '转化率%': round(_pct(onb, off), 1)},
         ])
-        stages = stages[stages['流失率%'] == stages['流失率%']]
+        stages = stages[stages['转化率%'] == stages['转化率%']]
         if not stages.empty:
-            fig = px.bar(stages, x='流失率%', y='环节', orientation='h', text='流失率%',
-                         color='流失率%', color_continuous_scale='Reds', range_color=[0, 100])
+            fig = px.bar(stages, x='转化率%', y='环节', orientation='h', text='转化率%',
+                         color='转化率%', color_continuous_scale='Blues', range_color=[0, 100])
             fig.update_layout(height=260, margin=dict(t=10, b=10, l=10, r=10), showlegend=False,
-                              coloraxis_showscale=False,
+                              coloraxis_showscale=False, xaxis_range=[0, 100],
                               paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
             st.plotly_chart(fig, width='stretch')
-            st.caption('每一环的流失率就是可以压缩的空间。')
 
-    st.markdown('**周期对标：红 = 慢于同类中位或超过目标**')
-    cyc = ana[(ana['状态'] == '完成招聘') & (ana['周期(天)'] == ana['周期(天)'])].copy()
-    if cyc.empty:
-        st.info('当前筛选下暂无完成招聘的岗位数据。')
+    st.markdown('**各公司转化对比**')
+    rows = []
+    for dept, g in base.groupby('department'):
+        r = _num(g['resumes'].fillna(0).sum())
+        i = _num(g['interviewed'].fillna(0).sum())
+        p = _num(g['passed'].fillna(0).sum())
+        o = _num(g['offer'].fillna(0).sum())
+        n = _num(g['onboarded'].fillna(0).sum())
+        rows.append({'公司/部门': dept, '收简历': r, '进面试': i, '发Offer': o, '入职': n,
+                     '简历→面试%': round(_pct(i, r), 1) if _pct(i, r) == _pct(i, r) else None,
+                     '面试→Offer%': round(_pct(o, p), 1) if _pct(o, p) == _pct(o, p) else None,
+                     'Offer→入职%': round(_pct(n, o), 1) if _pct(n, o) == _pct(n, o) else None})
+    st.dataframe(pd.DataFrame(rows).sort_values('收简历', ascending=False),
+                 width='stretch', hide_index=True)
+
+    st.subheader('五、周期分析')
+    done = ana[(ana['状态'] == '完成招聘') & (ana['周期(天)'] == ana['周期(天)'])].copy()
+    if done.empty:
+        st.info('暂无已完成岗位的周期数据。')
         return
-    cyc['是否异常'] = cyc['问题数'] > 0
-    cyc = cyc.sort_values('周期(天)')
-    bar2 = px.bar(cyc, x='周期(天)', y='岗位', orientation='h', text='周期(天)',
-                  color='是否异常', color_discrete_map={True: '#e05c5c', False: '#4c8bf5'},
-                  labels={'是否异常': '需关注'})
+    c3, c4 = st.columns(2)
+    with c3:
+        st.markdown('**周期分布（每个点=1 个完成岗位）**')
+        hist_fig = px.histogram(done, x='周期(天)', nbins=10, text_auto=True)
+        avg = _num(done['周期(天)'].mean())
+        med = _num(done['周期(天)'].median())
+        if avg == avg:
+            hist_fig.add_vline(x=avg, line_dash='dot', line_color='#e07b39', annotation_text=f'平均 {avg:.1f} 天')
+        if med == med:
+            hist_fig.add_vline(x=med, line_dash='dash', line_color='#2e9e6b', annotation_text=f'中位 {med:.0f} 天')
+        hist_fig.update_layout(height=320, margin=dict(t=30, b=10, l=10, r=10),
+                               paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
+        st.plotly_chart(hist_fig, width='stretch')
+    with c4:
+        st.markdown('**各公司平均周期**')
+        bydept = done.groupby('部门').agg(完成岗位=('岗位', 'count'), 平均周期=('周期(天)', 'mean')).reset_index()
+        bydept['平均周期'] = bydept['平均周期'].round(1)
+        bar = px.bar(bydept.sort_values('平均周期'), x='平均周期', y='部门', orientation='h',
+                     text='平均周期', color='平均周期', color_continuous_scale='YlOrRd')
+        bar.update_layout(height=320, margin=dict(t=30, b=10, l=10, r=10), showlegend=False,
+                          coloraxis_showscale=False,
+                          paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
+        st.plotly_chart(bar, width='stretch')
+
+    st.markdown('**每个已完成岗位的周期**')
+    cyc = done.sort_values('周期(天)', ascending=True)
+    bar2 = px.bar(cyc, x='周期(天)', y='岗位', orientation='h', text='周期(天)', color='部门')
     bar2.add_vline(x=target_days, line_dash='dash', line_color='#888',
                    annotation_text=f'目标 {target_days:.0f} 天', annotation_position='top')
-    avg = _num(cyc['周期(天)'].mean())
-    if avg == avg:
-        bar2.add_vline(x=avg, line_dash='dot', line_color='#2e9e6b',
-                       annotation_text=f'平均 {avg:.1f} 天', annotation_position='bottom')
-    bar2.update_layout(height=380, margin=dict(t=10, b=10, l=10, r=10), legend_title_text='',
+    bar2.update_layout(height=380, margin=dict(t=30, b=10, l=10, r=10), legend_title_text='',
                        paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
     st.plotly_chart(bar2, width='stretch')
+    st.caption('统计范围：已完成招聘的岗位；颜色按公司区分。')
 
-    st.markdown('**人员留存：入职 / 离职 / 现存**')
+
+def _dashboard_retention(d, ana):
+    """六、人员留存：入职 / 离职 / 现存，以及跟上次比的变化。"""
+    st.subheader('六、人员留存')
     ret = d.groupby('department').agg(入职=('onboarded', 'sum'), 离职=('left', 'sum'),
                                       现存=('current_headcount', 'sum')).reset_index()
     ret['留存%'] = ret.apply(
         lambda r: round((r['入职'] - r['离职']) / r['入职'] * 100, 1) if r['入职'] else float('nan'), axis=1)
     ret = ret.rename(columns={'department': '公司/部门'}).sort_values('入职', ascending=False)
-    st.dataframe(ret, width='stretch', hide_index=True)
+
+    c1, c2 = st.columns([2, 3])
+    with c1:
+        st.dataframe(ret, width='stretch', hide_index=True)
+        snap = _snapshots()
+        if len(snap) >= 2:
+            prev, cur = snap[-2], snap[-1]
+            dv = _num(cur.get('离职')) - _num(prev.get('离职'))
+            if dv == dv:
+                st.caption(f'离职人数较上次（{prev.get("date")}）：{dv:+.0f} 人')
+    with c2:
+        chart = ret[ret['入职'].fillna(0) > 0]
+        if chart.empty:
+            st.info('暂无可统计的入职数据。')
+        else:
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=chart['公司/部门'], y=chart['入职'], name='入职', marker_color='#2e9e6b'))
+            fig.add_trace(go.Bar(x=chart['公司/部门'], y=chart['离职'], name='离职', marker_color='#e05c5c'))
+            fig.add_trace(go.Scatter(x=chart['公司/部门'], y=chart['现存'], name='现存', mode='lines+markers',
+                                     line=dict(color='#4c8bf5', width=3)))
+            fig.update_layout(barmode='group', height=340, margin=dict(t=30, b=10, l=10, r=10),
+                              legend=dict(orientation='h', y=1.15), yaxis_title='人数',
+                              paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
+            st.plotly_chart(fig, width='stretch')
+
     left_pos = ana[ana['离职'] > 0]
     if left_pos.empty:
         st.caption('当前没有岗位出现入职后离职。留存% =（入职 − 离职）÷ 入职；现存人数为最后一次记录的在场人数。')
     else:
-        st.caption('出现离职的岗位：'
-                   + '、'.join(f"{r['岗位']}（入职 {_fmt_num(r['入职'])} · 离职 {_fmt_num(r['离职'])} · "
-                               f"现存 {_fmt_num(r['现存'])}）" for _, r in left_pos.iterrows()))
+        st.markdown('**出现离职的岗位**：'
+                    + '、'.join(f"{r['岗位']}（入职 {_fmt_num(r['入职'])} · 离职 {_fmt_num(r['离职'])} · "
+                                f"现存 {_fmt_num(r['现存'])}）" for _, r in left_pos.iterrows()))
 
 
-def _dashboard_trend(d):
-    """第五屏：变化 —— 和上次相比，好了还是差了。"""
-    st.subheader('五、变化：跟上次比')
-    snaps = _snapshots()
-    if len(snaps) < 2:
-        st.info('这是第一条记录。以后每次上传/修改数据（或每天第一次打开）都会自动记一条，'
-                '这里就会出现“比上次好了还是差了”的对比和趋势。')
-        return
-    prev, cur = snaps[-2], snaps[-1]
+def _dashboard_export(d, ana, target_days):
+    """把看板上的几张表一次导出成 Excel（多 sheet），方便直接发给老板。"""
+    try:
+        op = ana[ana['状态'] == '招聘中'].copy()
+        op['标注'] = op.apply(lambda r: '；'.join(_open_issues(r, target_days)), axis=1)
+        op['招聘起'] = pd.to_datetime(op['招聘起'], errors='coerce').dt.date.astype(str).replace('NaT', '')
 
-    def dlt(key, unit='', digits=0):
-        a, b = _num(cur.get(key)), _num(prev.get(key))
-        if a != a or b != b:
-            return None
-        return f'{a - b:+.{digits}f}{unit}'
+        dd = d[d['demand_max'].fillna(0) > 0]
+        dept = dd.groupby('department').agg(需求=('demand_max', 'sum'), 到位=('onboarded', 'sum')).reset_index()
+        dept['缺口'] = (dept['需求'] - dept['到位']).clip(lower=0)
+        dept['达成率%'] = (dept['到位'] / dept['需求'] * 100).round(0)
+        dept = dept.rename(columns={'department': '公司/部门'}).sort_values('达成率%', ascending=False)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric('到位人数', _fmt_num(cur.get('到位')), dlt('到位', ' 人'), delta_color='normal')
-    c2.metric('在招岗位', _fmt_num(cur.get('在招')), dlt('在招', ' 个'), delta_color='inverse')
-    c3.metric('平均周期', f"{_fmt_num(cur.get('平均周期'), 1)} 天", dlt('平均周期', ' 天', 1), delta_color='inverse')
-    c4.metric('简历→入职转化', _fmt_pct(cur.get('转化率'), 2), dlt('转化率', ' pt', 2), delta_color='normal')
-    st.caption(f'对比区间：{prev.get("date")} → {cur.get("date")}（每次数据变化自动记录一条快照，最多保留 {SNAP_MAX} 条）')
+        tmp = d.copy()
+        tmp['月份'] = pd.to_datetime(tmp['start_date'], errors='coerce').dt.to_period('M').astype(str)
+        month = tmp[tmp['月份'] != 'NaT'].groupby('月份').size().rename('新增岗位').reset_index()
 
-    hist = pd.DataFrame(snaps)
-    keep = [c for c in ['date', '到位', '在招', '平均周期', '转化率'] if c in hist.columns]
-    hist = hist[keep].tail(12)
-    h1, h2 = st.columns(2)
-    with h1:
-        if '到位' in hist.columns:
-            line1 = px.line(hist, x='date', y='到位', markers=True, title='到位人数走势')
-            line1.update_layout(height=260, margin=dict(t=30, b=10, l=10, r=10),
-                                paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
-            st.plotly_chart(line1, width='stretch')
-    with h2:
-        if '平均周期' in hist.columns:
-            line2 = px.line(hist, x='date', y='平均周期', markers=True, title='平均招聘周期走势（天）')
-            line2.update_layout(height=260, margin=dict(t=30, b=10, l=10, r=10),
-                                paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
-            st.plotly_chart(line2, width='stretch')
-    with st.expander('历次快照明细', expanded=False):
-        st.dataframe(hist.iloc[::-1], width='stretch', hide_index=True)
+        ret = d.groupby('department').agg(入职=('onboarded', 'sum'), 离职=('left', 'sum'),
+                                          现存=('current_headcount', 'sum')).reset_index()
+        ret['留存%'] = ret.apply(
+            lambda r: round((r['入职'] - r['离职']) / r['入职'] * 100, 1) if r['入职'] else None, axis=1)
+        ret = ret.rename(columns={'department': '公司/部门'})
+
+        detail = ana[[c for c in ['岗位', '部门', '类目', '状态', '需求', '入职', '周期(天)', '同类中位(天)',
+                                  '简历', '面试', '通过', 'Offer', '离职', '现存', '简历→面试%', '面试→通过%',
+                                  'Offer→入职%', '招聘起', '招聘止'] if c in ana.columns]].copy()
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine='openpyxl') as w:
+            detail.to_excel(w, index=False, sheet_name='岗位明细')
+            op[['岗位', '部门', '招聘起', '周期(天)', '目标(天)', '需求', '简历', '面试', '标注']].to_excel(
+                w, index=False, sheet_name='在招跟踪')
+            dept.to_excel(w, index=False, sheet_name='公司达成')
+            month.to_excel(w, index=False, sheet_name='月度新增')
+            ret.to_excel(w, index=False, sheet_name='人员留存')
+        st.download_button('⬇️ 导出看板 Excel（5 个表）', buf.getvalue(),
+                           file_name=f"招聘看板_{pd.Timestamp.today().date()}.xlsx",
+                           mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                           key='dash_export')
+    except Exception as e:
+        st.caption(f'（导出暂时不可用：{e}）')
 
 
-def _dashboard_detail(d, ana, only_risk):
-    """第六屏：岗位明细（备查）。"""
+def _dashboard_detail(d, ana, only_risk, target_days):
+    """七、岗位明细（备查与导出）。标注只针对在招岗位。"""
     detail = d.reset_index(drop=True)
-    extra = ana[['周期(天)', '主要卡点', '问题数']].copy()
-    extra['异常'] = extra['问题数'].apply(lambda n: f'⚠️ {int(n)} 项' if n else '')
-    detail = pd.concat([detail, extra[['周期(天)', '主要卡点', '异常', '问题数']]], axis=1)
+    extra = ana[['周期(天)', '主要卡点']].copy()
+    extra['标注'] = ana.apply(
+        lambda r: '；'.join(_open_issues(r, target_days)) if r['状态'] == '招聘中' else '', axis=1)
+    extra['待跟进'] = (extra['标注'].fillna('').str.len() > 0).astype(int)
+    detail = pd.concat([detail, extra[['周期(天)', '主要卡点', '标注', '待跟进']]], axis=1)
     if only_risk:
-        detail = detail[detail['问题数'] > 0]
+        detail = detail[detail['待跟进'] > 0]
 
-    with st.expander('六、岗位明细（备查，含异常标记）', expanded=False):
+    with st.expander('七、岗位明细（备查 / 导出）', expanded=False):
         if detail.empty:
-            st.info('当前筛选范围内没有需要关注的岗位。')
+            st.info('当前筛选范围内没有需要跟进的在招岗位。')
             return
         disp = detail.drop(columns=['duration_days'], errors='ignore').copy()
         disp['招聘起'] = disp['start_date'].dt.date.astype(str).replace('NaT', '—')
@@ -1171,7 +1255,7 @@ def _dashboard_detail(d, ana, only_risk):
         for ec in du.extra_columns(d):
             en2cn[ec] = ec
         disp = disp.rename(columns=en2cn)
-        order = ['岗位', '部门', '招聘类目', '当前状态', '周期(天)', '异常', '主要卡点', '招聘需求',
+        order = ['岗位', '部门', '招聘类目', '当前状态', '周期(天)', '标注', '主要卡点', '招聘需求',
                  '推送简历', '邀约', '面试', '通过', 'Offer', '入职', '离职', '现存', '日均简历',
                  '招聘起', '招聘止']
         order += [ec for ec in du.extra_columns(d)]
@@ -1180,7 +1264,7 @@ def _dashboard_detail(d, ana, only_risk):
 
 def page_dashboard():
     st.title('📊 招聘经营看板')
-    st.caption('给老板看的一页：结论 → 需要拍板的事 → 进度 → 效率 → 变化 → 明细。'
+    st.caption('总览 · 时间趋势 · 组织结构 · 转化漏斗 · 周期分析 · 人员留存 · 岗位明细。'
                '上传新数据默认合并保留历史，也可在线增删改。')
 
     with st.expander('🗂️ 数据管理：上传合并 / 在线增删改 / 字段管理 / 导出', expanded=False):
@@ -1220,12 +1304,13 @@ def page_dashboard():
     target_days = float(target_days)
     ana = _position_analysis(d, target_days, float(slow_ratio))
     _save_snapshot(d)                                  # 每天第一次打开自动记一条快照
-    _dashboard_summary(d, ana, target_days)            # 一、总览（含在招岗位与自动标注统计）
-    _dashboard_positions(d, ana, only_risk, target_days)   # 二、岗位全景（自动标注）
-    _dashboard_progress(d, ana, target_days)           # 三、进度：谁快谁慢
-    _dashboard_efficiency(d, ana, target_days)         # 四、转化与留存
-    _dashboard_trend(d)                                # 五、变化：跟上次比
-    _dashboard_detail(d, ana, only_risk)               # 六、明细（折叠）
+    _dashboard_summary(d, ana, target_days)               # 一、总览（指标 + 在招岗位进度）
+    _dashboard_monthly(d)                                 # 二、时间趋势（按月）
+    _dashboard_progress(d, ana, target_days)              # 三、组织结构与达成
+    _dashboard_efficiency(d, ana, target_days)            # 四、转化漏斗 + 五、周期分析
+    _dashboard_retention(d, ana)                          # 六、人员留存
+    _dashboard_detail(d, ana, only_risk, target_days)     # 七、明细
+    _dashboard_export(d, ana, target_days)                # 导出（多表 Excel）
 
 
 # ==================== 岗位匹配：①岗位信息 → ②批量上传 → ③智能打分 ====================
@@ -1464,16 +1549,59 @@ def render_run(run):
         res = res.sort_values('匹配分', ascending=False).reset_index(drop=True)
     res.insert(0, '排名', res.index + 1)
     st.caption(f"岗位：{run.get('position', '')} ｜ 打分方式：{run.get('mode', '')} ｜ 时间：{run.get('time', '')}")
-    st.dataframe(res, width='stretch', height=380, hide_index=True, column_config={
-        '匹配分': st.column_config.ProgressColumn('匹配分', min_value=0, max_value=100, format='%.1f'),
-        '排名': st.column_config.NumberColumn('排名'),
-    })
-    st.download_button('下载打分结果 CSV', res.to_csv(index=False).encode('utf-8-sig'),
-                       file_name=f"匹配打分结果_{run.get('position', '')}_{run.get('time', '').replace(':', '')}.csv",
-                       mime='text/csv', key=f"csv_{run.get('id')}")
-    st.markdown('**筛选建议**：匹配分 ≥ 70 建议约面 ｜ 50–69 待定 ｜ < 50 暂缓')
+
+    if '匹配分' in res.columns:
+        hi = res[res['匹配分'] >= 70]
+        mid = res[(res['匹配分'] >= 50) & (res['匹配分'] < 70)]
+        low = res[res['匹配分'] < 50]
+        c = st.columns(3)
+        c[0].metric('建议约面（≥70）', f'{len(hi)} 人', f'最高 {_fmt_num(res["匹配分"].max(), 1)} 分',
+                    delta_color='off')
+        c[1].metric('待定（50–69）', f'{len(mid)} 人', delta_color='off')
+        c[2].metric('暂缓（<50）', f'{len(low)} 人', delta_color='off')
+        tabs = st.tabs([f'建议约面 {len(hi)}', f'待定 {len(mid)}', f'暂缓 {len(low)}', f'全部 {len(res)}'])
+        for tab, part in zip(tabs, [hi, mid, low, res]):
+            with tab:
+                if part.empty:
+                    st.caption('这一档暂时没有候选人。')
+                else:
+                    st.dataframe(part, width='stretch', hide_index=True, height=min(140 + 36 * len(part), 520),
+                                 column_config={
+                                     '匹配分': st.column_config.ProgressColumn('匹配分', min_value=0, max_value=100,
+                                                                               format='%.1f'),
+                                     '排名': st.column_config.NumberColumn('排名')})
+    else:
+        st.dataframe(res, width='stretch', hide_index=True, height=380)
 
     details = run.get('details') or []
+    det_rows = []
+    for d in sorted(details, key=lambda x: -(x.get('score') or 0)):
+        ai = d.get('ai') or {}
+        local = d.get('local') or {}
+        det_rows.append({
+            '姓名': d.get('name'), '电话': d.get('phone'), '学历': d.get('education'),
+            '经验': d.get('years_raw'), '匹配分': d.get('score'), '建议': d.get('tag'),
+            'AI摘要': ai.get('summary', ''), '优势': '；'.join(ai.get('strengths') or []),
+            '不足': '；'.join(ai.get('gaps') or []), '亮点': '；'.join(ai.get('highlights') or []),
+            'AI建议': ai.get('suggestion', ''), '简历来源': d.get('source'),
+            '本地规则分': (f"学历 {local.get('edu_score', 0)}/20 ｜ 经验 {local.get('exp_score', 0)}/30 ｜ "
+                           f"技能 {local.get('skill_score', 0)}/40 ｜ 硬性 {local.get('hard_score', 0)}/10"),
+        })
+    try:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine='openpyxl') as w:
+            res.to_excel(w, index=False, sheet_name='打分结果')
+            if det_rows:
+                pd.DataFrame(det_rows).to_excel(w, index=False, sheet_name='候选人详情')
+        st.download_button('⬇️ 导出 Excel（结果 + 候选人详情）', buf.getvalue(),
+                           file_name=f"匹配打分结果_{run.get('position', '')}_{run.get('time', '').replace(':', '')}.xlsx",
+                           mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                           key=f"xlsx_{run.get('id')}")
+    except Exception:
+        st.download_button('下载打分结果 CSV', res.to_csv(index=False).encode('utf-8-sig'),
+                           file_name=f"匹配打分结果_{run.get('position', '')}.csv",
+                           mime='text/csv', key=f"csv_{run.get('id')}")
+
     if not details:
         return
     st.markdown('**候选人详情**')
