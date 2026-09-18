@@ -614,13 +614,8 @@ def _data_manage():
         st.rerun()
 
 
-def page_dashboard():
-    st.title('📊 数据看板')
-    st.caption('岗位招聘漏斗、周期与转化效率总览。上传新数据默认合并保留历史，也可在线增删改。')
 # ---------------- 老板视角：结论指标 / 风险岗位 / 卡点分析 ----------------
 
-    with st.expander('🗂️ 数据管理：上传合并 / 在线增删改 / 字段管理 / 导出', expanded=False):
-        _data_manage()
 def _num(v, default=float('nan')):
     try:
         if v is None or pd.isna(v):
@@ -629,23 +624,13 @@ def _num(v, default=float('nan')):
     except Exception:
         return default
 
-    df = du.load_current_data()
 
-    with st.sidebar:
-        st.subheader('筛选')
-        sel_status = st.multiselect('当前状态', du.STATUS_ORDER, default=du.STATUS_ORDER)
-        depts = sorted(df['department'].dropna().unique().tolist())
-        sel_dept = st.multiselect('部门', depts, default=depts)
-        cats = sorted(df['category'].dropna().unique().tolist())
-        sel_cat = st.multiselect('招聘类目', cats, default=cats)
 def _pct(num, den):
     n, m = _num(num), _num(den)
     if m != m or not m:
         return float('nan')
     return n / m * 100
 
-    mask = (df['status'].isin(sel_status)) & (df['department'].isin(sel_dept)) & (df['category'].isin(sel_cat))
-    d = df[mask].copy()
 
 def _fmt_num(v, digits=0):
     v = _num(v)
@@ -669,7 +654,6 @@ def _worked_days(r, today):
 def _drop_blank_rows(d):
     """去掉 Excel 里既没有岗位名、也没有部门的空行/合计行。返回（数据, 丢掉的行数）。"""
     if d.empty:
-        st.warning('当前筛选条件下没有数据，请调整筛选。')
         return d, 0
     blank = d[d['position'].astype(str).str.strip().isin(['未命名岗位', '', 'nan', 'None'])
               & d['department'].astype(str).str.strip().isin(['未填写', '', 'nan', 'None'])]
@@ -840,21 +824,10 @@ def _dashboard_risks(ana):
         st.success('✅ 当前筛选范围内没有发现异常：在招岗位都没超期，招聘周期与各环节转化也在正常区间。')
         return
 
-    kpis = du.compute_kpis(d)
-    labels = {
-        'total_positions': '岗位总数', 'hiring': '招聘中', 'done': '完成招聘', 'paused': '暂停',
-        'total_resumes': '推送简历', 'total_interviewed': '面试人数', 'total_passed': '面试通过',
-        'total_offer': 'Offer 人数', 'total_onboarded': '入职人数', 'avg_duration': '平均招聘周期(天)',
-        'median_duration': '中位周期(天)', 'current': '现存人数', 'total_left': '离职人数',
-    }
     st.warning(f'⚠️ {len(risk)} 个岗位需要跟进：'
                + '、'.join(f'{r["岗位"]}（{r["主要卡点"]}）' for _, r in risk.head(5).iterrows())
                + ('…' if len(risk) > 5 else ''))
 
-    st.subheader('核心指标')
-    kpi_row(kpis, ['total_positions', 'hiring', 'done', 'paused'], labels)
-    kpi_row(kpis, ['total_resumes', 'total_interviewed', 'total_offer', 'total_onboarded'], labels)
-    kpi_row(kpis, ['avg_duration', 'median_duration', 'current', 'total_left'], labels)
     cols = ['岗位', '部门', '状态', '周期(天)', '目标(天)', '同类中位(天)', '需求', '入职',
             '简历', '面试', 'Offer', '简历→面试%', '面试→通过%', 'Offer→入职%', '主要卡点', '主要问题']
     show = risk[[c for c in cols if c in risk.columns]]
@@ -892,12 +865,6 @@ def _dashboard_charts(d, ana, target_days):
     """漏斗、状态分布、部门对比、周期排行（异常岗位标红）。"""
     c1, c2 = st.columns([3, 2])
     with c1:
-        st.subheader('招聘漏斗')
-        fig = du.build_funnel_fig(d)
-        invited_ok = d['invited'].notna().sum() >= 5
-        if not invited_ok:
-            st.caption('注：“邀约面试”环节多数岗位未填写，漏斗已自动省略该环节。')
-        st.plotly_chart(fig, width='stretch')
         st.subheader('三、招聘漏斗与转化')
         st.plotly_chart(du.build_funnel_fig(d), width='stretch')
         st.caption(
@@ -909,8 +876,6 @@ def _dashboard_charts(d, ana, target_days):
     with c2:
         st.subheader('招聘状态分布')
         status_cnt = d['status'].value_counts().reindex(du.STATUS_ORDER).dropna()
-        pie = px.pie(values=status_cnt.values, names=status_cnt.index,
-                     color=status_cnt.index,
         pie = px.pie(values=status_cnt.values, names=status_cnt.index, color=status_cnt.index,
                      color_discrete_map={s: du.status_label(s) for s in status_cnt.index})
         pie.update_traces(textinfo='label+value')
@@ -920,15 +885,8 @@ def _dashboard_charts(d, ana, target_days):
 
     c3, c4 = st.columns(2)
     with c3:
-        st.subheader('各部门岗位与入职情况')
         st.subheader('各部门进度与达成')
         dep = du.department_summary(d)
-        bar = px.bar(dep.sort_values('岗位数', ascending=True), x='岗位数', y='部门', orientation='h',
-                     color='入职总数', color_continuous_scale='Blues', text='岗位数',
-                     labels={'岗位数': '岗位数'})
-        bar.update_layout(height=380, margin=dict(t=10, b=10, l=10, r=10), showlegend=False,
-                          paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
-        st.plotly_chart(bar, width='stretch')
         if dep.empty:
             st.info('暂无部门数据。')
         else:
@@ -951,19 +909,11 @@ def _dashboard_charts(d, ana, target_days):
             st.dataframe(agg.sort_values('达成率%', ascending=False), width='stretch', hide_index=True)
             st.caption('达成率 = 该部门「有招聘需求」岗位的入职人数 ÷ 需求人数；入职总数含没填需求的岗位。')
     with c4:
-        st.subheader('完成招聘岗位 · 招聘周期(天)')
-        dur = du.position_duration(d)
-        if dur.empty:
         st.subheader('招聘周期与异常标红')
         cyc = ana[(ana['状态'] == '完成招聘') & (ana['周期(天)'] == ana['周期(天)'])].copy()
         if cyc.empty:
             st.info('当前筛选下暂无完成招聘的岗位数据。')
         else:
-            bar2 = px.bar(dur, x='周期(天)', y='position', orientation='h', text='周期(天)',
-                          color='周期(天)', color_continuous_scale='YlOrRd',
-                          labels={'position': '岗位'})
-            bar2.update_layout(height=380, margin=dict(t=10, b=10, l=10, r=10), showlegend=False,
-                               yaxis=dict(autorange='reversed'),
             cyc['是否异常'] = cyc['问题数'] > 0
             cyc = cyc.sort_values('周期(天)')
             bar2 = px.bar(cyc, x='周期(天)', y='岗位', orientation='h', text='周期(天)',
@@ -976,10 +926,6 @@ def _dashboard_charts(d, ana, target_days):
             st.plotly_chart(bar2, width='stretch')
             st.caption('红色 = 被判定为需要关注的岗位（超目标周期，或明显慢于同类岗位）。')
 
-    st.subheader('岗位明细')
-    show = d.copy()
-    show['招聘起'] = show['start_date'].dt.date.astype(str).replace('NaT', '—')
-    show['招聘止'] = show['end_date'].dt.date.astype(str).replace('NaT', '—')
 
 def page_dashboard():
     st.title('📊 数据看板 · 项目视角')
@@ -1040,22 +986,15 @@ def page_dashboard():
     disp['招聘起'] = disp['start_date'].dt.date.astype(str).replace('NaT', '—')
     disp['招聘止'] = disp['end_date'].dt.date.astype(str).replace('NaT', '—')
     for col in du.NUMERIC_COLS:
-        if col in show.columns:
-            show[col] = show[col].round(1)
-    rename = {
         if col in disp.columns and col != 'duration_days':
             disp[col] = disp[col].round(1)
     en2cn = {
         'position': '岗位', 'department': '部门', 'category': '招聘类目', 'status': '当前状态',
         'resumes': '推送简历', 'invited': '邀约', 'interviewed': '面试', 'passed': '通过',
         'offer': 'Offer', 'onboarded': '入职', 'left': '离职', 'current_headcount': '现存',
-        'demand': '招聘需求', 'duration_days': '周期(天)', 'daily_resumes': '日均简历',
         'demand': '招聘需求', 'daily_resumes': '日均简历',
     }
     for ec in du.extra_columns(d):
-        rename[ec] = ec
-    show = show[[c for c in rename if c in show.columns]].rename(columns=rename)
-    st.dataframe(show, width='stretch', height=420, hide_index=True)
         en2cn[ec] = ec
     disp = disp.rename(columns=en2cn)
     order = ['岗位', '部门', '招聘类目', '当前状态', '周期(天)', '异常', '主要卡点', '招聘需求',
@@ -1520,3 +1459,8 @@ with st.sidebar:
     st.title('🎯 招聘 HR 工作台')
     page = st.radio('功能模块', list(pages.keys()), label_visibility='collapsed')
 st.sidebar.caption('智能打分调用 DeepSeek API（填 Key 后可用）；本地规则打分不依赖网络与 AI。')
+
+if st.session_state.get('flash'):
+    st.success(st.session_state.pop('flash'))
+_boot_restore()
+pages[page]()
