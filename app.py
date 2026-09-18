@@ -760,7 +760,7 @@ def _position_analysis(d, target_days, ratio):
             '目标(天)': float(target_days),
             '同类中位(天)': round(base, 1) if base == base else float('nan'),
             '需求': demand_max, '简历': resumes, '面试': interviewed, 'Offer': offer, '入职': onboarded,
-            '通过': passed, '离职': left,
+            '通过': passed, '离职': left, '现存': _num(r.get('current_headcount')),
             '简历→面试%': round(r2i, 1) if r2i == r2i else float('nan'),
             '面试→通过%': round(i2p, 1) if i2p == i2p else float('nan'),
             'Offer→入职%': round(o2o, 1) if o2o == o2o else float('nan'),
@@ -788,6 +788,8 @@ def _headline_metrics(d):
     with_offer = d[d['offer'].fillna(0) > 0]
     offer = float(with_offer['offer'].fillna(0).sum())
     onb_offer = float(with_offer['onboarded'].fillna(0).sum())
+    left = float(d['left'].fillna(0).sum())
+    current = float(d['current_headcount'].fillna(0).sum())
     return {
         'date': str(pd.Timestamp.today().date()),
         'saved_at': _now_str(),
@@ -799,6 +801,9 @@ def _headline_metrics(d):
         '平均周期': round(_num(done['duration_days'].dropna().mean()), 1) if not done.empty else None,
         '简历': round(resumes, 1),
         '入职': round(onboarded, 1),
+        '离职': round(left, 1),
+        '现存': round(current, 1),
+        '留存率': round((onboarded - left) / onboarded * 100, 1) if onboarded else None,
         '转化率': round(onboarded / resumes * 100, 2) if resumes else None,
         'Offer接受率': min(round(onb_offer / offer * 100, 1), 100.0) if offer else None,
     }
@@ -837,7 +842,7 @@ def _delta_vs_prev(m):
     if not prev:
         return None
     out = {'_date': prev.get('date')}
-    for k in ('需求', '到位', '在招', '平均周期', '转化率', 'Offer接受率'):
+    for k in ('需求', '到位', '在招', '平均周期', '转化率', 'Offer接受率', '留存率'):
         a, b = _num(m.get(k)), _num(prev.get(k))
         out[k] = (a - b) if (a == a and b == b) else None
     return out
@@ -849,169 +854,135 @@ def _delta_txt(dv, key, unit='', digits=0):
     return f'{dv[key]:+.{digits}f}{unit}（较 {dv["_date"]}）'
 
 
+def _open_positions_text(ana):
+    """在招岗位名单（回答“在招的到底是哪几个岗位”）。"""
+    op = ana[ana['状态'] == '招聘中']
+    if op.empty:
+        return '当前没有在招岗位'
+    parts = []
+    for _, r in op.sort_values('周期(天)', ascending=False).iterrows():
+        days = f"{_fmt_num(r['周期(天)'])} 天" if r['周期(天)'] == r['周期(天)'] else '起始日未填'
+        gap = f"缺口 {_fmt_num(max(_num(r['需求'], 0) - _num(r['入职'], 0), 0))} 人" if r['需求'] == r['需求'] else ''
+        parts.append(f"{r['岗位']}（{r['部门']} · 已招 {days}{' · ' + gap if gap else ''}）")
+    return '、'.join(parts)
+
+
+def _flag_counts(ana):
+    """自动标注的分类统计。"""
+    risk = ana[ana['问题数'] > 0]
+    q = risk['主要问题'].fillna('')
+    return {
+        '岗位数': int(len(risk)),
+        '周期': int(q.str.contains('周期|超期', regex=True).sum()),
+        '简历转化': int(q.str.contains('简历→面试').sum()),
+        '面试通过': int(q.str.contains('面试通过率').sum()),
+        'Offer流失': int(q.str.contains('Offer 流失').sum()),
+        '未招满': int(q.str.contains('未招满').sum()),
+        '离职': int(q.str.contains('离职').sum()),
+    }
+
+
 def _dashboard_summary(d, ana, target_days):
-    """第一屏：3 秒看懂现状 —— 状态灯、四个北极星指标、比上次的变化。"""
+    """第一屏：现状一眼看清 —— 状态灯、关键指标、在招岗位、自动标注统计。"""
     m = _headline_metrics(d)
     dv = _delta_vs_prev(m)
     overdue = int(((ana['状态'] == '招聘中') & (ana['周期(天)'] > target_days)).sum())
     risk_n = int((ana['问题数'] > 0).sum())
-    rate, cyc, conv, accept = _num(m['到位率']), _num(m['平均周期']), _num(m['转化率']), _num(m['Offer接受率'])
+    rate, cyc = _num(m['到位率']), _num(m['平均周期'])
+    conv, accept, retain = _num(m['转化率']), _num(m['Offer接受率']), _num(m['留存率'])
 
     lv_rate = 'green' if rate == rate and rate >= 100 else ('amber' if rate == rate and rate >= 80 else 'red')
     lv_risk = 'green' if (overdue == 0 and risk_n == 0) else ('amber' if (overdue <= 2 and risk_n <= 5) else 'red')
     lv_cyc = 'green' if (cyc != cyc or cyc <= target_days) else ('amber' if cyc <= target_days * 1.3 else 'red')
-    lv_conv = 'green' if (conv == conv and conv >= 8) else ('amber' if conv == conv and conv >= 4 else 'red')
+    lv_retain = 'green' if (retain != retain or retain >= 90) else ('amber' if retain >= 80 else 'red')
     order = ['green', 'amber', 'red']
-    overall = max([lv_rate, lv_risk, lv_cyc, lv_conv], key=order.index)
+    overall = max([lv_rate, lv_risk, lv_cyc, lv_retain], key=order.index)
 
-    st.subheader('一、结论：3 秒看懂')
+    st.subheader('一、总览')
     c1, c2, c3, c4 = st.columns(4)
     c1.metric(f'{_health(lv_rate)} 需求到位率', _fmt_pct(rate, 0) if rate == rate else '—',
               _delta_txt(dv, '到位', ' 人') or f"{_fmt_num(m['到位'])}/{_fmt_num(m['需求'])} 人")
-    c2.metric(f'{_health(lv_risk)} 在招与风险', f"{m['在招']} 个在招",
-              (f'超期 {overdue} 个 · 问题岗位 {risk_n} 个' if (overdue or risk_n) else '无超期、无异常'),
+    c2.metric(f'{_health(lv_risk)} 在招岗位', f"{m['在招']} 个",
+              (f'超期 {overdue} 个 · 有标注 {risk_n} 个' if (overdue or risk_n) else '无超期、无标注'),
               delta_color='inverse' if (overdue or risk_n) else 'off')
     c3.metric(f'{_health(lv_cyc)} 平均招聘周期', f'{_fmt_num(cyc, 1)} 天',
               _delta_txt(dv, '平均周期', ' 天', 1) or f'目标 {target_days:.0f} 天', delta_color='inverse')
-    c4.metric(f'{_health(lv_conv)} 简历→入职转化', _fmt_pct(conv) if conv == conv else '—',
-              _delta_txt(dv, '转化率', ' pt', 2) or f"累计 {_fmt_num(m['简历'])} 份简历")
+    c4.metric(f'{_health(lv_retain)} 入职留存率', _fmt_pct(retain, 0) if retain == retain else '—',
+              _delta_txt(dv, '留存率', ' pt', 1) or
+              (f"入职 {_fmt_num(m['入职'])} · 离职 {_fmt_num(m['离职'])} · 现存 {_fmt_num(m['现存'])}"),
+              delta_color='inverse')
+
+    st.markdown(f"**在招岗位（{m['在招']} 个）**：{_open_positions_text(ana)}")
+    fc = _flag_counts(ana)
+    if fc['岗位数']:
+        detail = '、'.join(f'{k} {v}' for k, v in fc.items() if k != '岗位数' and v)
+        st.markdown(f"**⚠️ 自动标注（{fc['岗位数']} 个岗位）**：{detail}"
+                    '　—　标注口径见本节末与「岗位全景」表的"标注"列。')
+    else:
+        st.markdown('**✅ 自动标注**：当前没有需要标注的岗位。')
 
     if overall == 'green':
-        st.success('🟢 整体健康，暂时不需要你介入。')
+        st.success('🟢 整体健康：到位率、周期、留存都在正常区间。')
     elif overall == 'amber':
-        st.warning(f'🟡 基本正常，但有 {risk_n} 个岗位需要跟进 —— 下面第二节列的是需要你拍板或给资源的事。')
+        st.warning(f'🟡 基本正常，但有 {risk_n} 个岗位被自动标注（见下方岗位全景表）。')
     else:
-        st.error(f'🔴 有需要立刻处理的问题：{risk_n} 个岗位异常，其中 {overdue} 个在招岗位已超期。')
+        st.error(f'🔴 需要关注：{risk_n} 个岗位被自动标注，其中 {overdue} 个在招岗位已超目标周期。')
 
     st.caption(
         f"到位 {_fmt_num(m['到位'])}/{_fmt_num(m['需求'])} 人（{_fmt_pct(rate, 0)}）｜在招 {m['在招']} 个（超期 {overdue} 个）"
-        f"｜平均周期 {_fmt_num(cyc, 1)} 天｜Offer 接受率 {_fmt_pct(accept, 0)}"
+        f"｜平均周期 {_fmt_num(cyc, 1)} 天｜简历→入职 {_fmt_pct(conv)}｜Offer 接受率 {_fmt_pct(accept, 0)}"
+        f"｜入职留存率 {_fmt_pct(retain, 0)}（离职 {_fmt_num(m['离职'])} 人）"
         f'　｜　状态灯口径：到位率 ≥100% 🟢、≥80% 🟡；在招无超期且无异常 🟢；周期 ≤{target_days:.0f} 天 🟢；'
-        '简历→入职 ≥8% 🟢、≥4% 🟡。')
+        '留存率 ≥90% 🟢、≥80% 🟡。')
 
 
-def _decision_items(d, ana, target_days):
-    """把异常按“同一类问题”聚合成老板要拍板的事项（不是岗位清单）。"""
-    risk = ana[ana['问题数'] > 0]
-    items = []
+def _dashboard_positions(d, ana, only_risk, target_days):
+    """第二屏：岗位全景 —— 一行一个岗位，问题直接标注在这张表里。"""
+    st.subheader('二、岗位全景（问题自动标注）')
+    tab = ana.copy()
+    tab['缺口'] = tab.apply(
+        lambda r: max(_num(r['需求'], 0) - _num(r['入职'], 0), 0) if r['需求'] == r['需求'] else float('nan'), axis=1)
+    tab['留存%'] = tab.apply(
+        lambda r: round((_num(r['入职'], 0) - _num(r['离职'], 0)) / _num(r['入职'], 0) * 100, 1)
+        if _num(r['入职'], 0) > 0 else float('nan'), axis=1)
+    tab['标注'] = tab['主要问题'].fillna('')
+    if only_risk:
+        tab = tab[tab['问题数'] > 0]
+    order_key = {'招聘中': 0, '暂停': 1, '完成招聘': 2}
+    tab['_sort'] = tab['状态'].map(lambda s: order_key.get(s, 3))
+    tab = tab.sort_values(['_sort', '严重度', '周期(天)'], ascending=[True, False, False])
 
-    def join_names(rows, a='简历', b='面试'):
-        return '、'.join(f"{r['岗位']}（{_fmt_num(r[a])}→{_fmt_num(r[b])}）" for _, r in rows.iterrows())
-
-    sub = risk[(risk['简历→面试%'] < 10) & (risk['简历'] >= 10)]
-    if not sub.empty:
-        res, itv = float(sub['简历'].sum()), float(sub['面试'].sum())
-        paused = int((sub['状态'] == '暂停').sum())
-        items.append({
-            '类型': '渠道 / 简历质量',
-            '标题': f"{len(sub)} 个岗位收了 {res:.0f} 份简历，只进 {itv:.0f} 人面试（{itv / res * 100:.1f}%）",
-            '涉及岗位': join_names(sub),
-            '影响': f"约 {res - itv:.0f} 份简历没有产出" + (f"，其中 {paused} 个岗位已经暂停招聘" if paused else ''),
-            '建议': '先停掉产出最差的渠道，改走校招/内推；同时复核这些岗位的学历、经验硬性条件是不是卡得过严',
-            '需要老板': '确认是否放宽硬性条件、是否批准更换招聘渠道',
-            '严重度': 3,
-        })
-
-    sub = risk[(risk['面试→通过%'] < 30) & (risk['面试'] >= 5)]
-    if not sub.empty:
-        itv, pss = float(sub['面试'].sum()), float(sub['通过'].sum())
-        items.append({
-            '类型': '用人标准 / 面试',
-            '标题': f"{len(sub)} 个岗位面了 {itv:.0f} 人，只过 {pss:.0f} 人（{pss / itv * 100:.0f}%）",
-            '涉及岗位': join_names(sub, '面试', '通过'),
-            '影响': '简历筛选没问题，但面试大量淘汰：岗位画像与用人部门期望可能不一致，也在消耗面试官时间',
-            '建议': '拉用人部门做一次标准对齐，复盘 3～5 份典型被淘汰的简历',
-            '需要老板': '请用人部门负责人配合对齐面试标准（或确认标准是否过严）',
-            '严重度': 2,
-        })
-
-    sub = risk[(risk['Offer→入职%'] < 80) & (risk['Offer'] >= 1)]
-    if not sub.empty:
-        off, onb = float(sub['Offer'].sum()), float(sub['入职'].sum())
-        items.append({
-            '类型': '薪酬 / Offer 竞争力',
-            '标题': f"{len(sub)} 个岗位发出 {off:.0f} 个 Offer，只入职 {onb:.0f} 人（接受率 {onb / off * 100:.0f}%）",
-            '涉及岗位': join_names(sub, 'Offer', '入职'),
-            '影响': f"{off - onb:.0f} 人在 Offer 阶段流失，前面所有筛选投入作废，岗位空缺时间被拉长",
-            '建议': '对比同岗位市场薪资、压缩发 Offer 到入职的间隔、增加入职前跟进',
-            '需要老板': '是否需要调整薪资区间，或授权更快给出 Offer',
-            '严重度': 3,
-        })
-
-    over = risk[(risk['状态'] == '招聘中') & (risk['周期(天)'] > target_days)]
-    slow = risk[(risk['状态'] != '招聘中') & (risk['主要问题'].str.contains('偏长', na=False))]
-    if not over.empty or not slow.empty:
-        parts = [f"{r['岗位']}（{r['状态']}，{_fmt_num(r['周期(天)'])} 天）" for _, r in over.iterrows()]
-        parts += [f"{r['岗位']}（{_fmt_num(r['周期(天)'])} 天，同类中位 {_fmt_num(r['同类中位(天)'])} 天）"
-                  for _, r in slow.iterrows()]
-        items.append({
-            '类型': '周期 / 推进节奏',
-            '标题': f"{len(over) + len(slow)} 个岗位周期偏长（目标 {target_days:.0f} 天）",
-            '涉及岗位': '、'.join(parts),
-            '影响': '岗位空缺时间拉长，直接影响业务用人；超期岗位越多，业务侧催办越多',
-            '建议': '逐个拆卡点：是简历不足、面试排期慢，还是用人部门决策慢，再对症处理',
-            '需要老板': '如果这些岗位业务紧急，请确认是否加急（加预算 / 指定专人跟进）',
-            '严重度': 3 if not over.empty else 2,
-        })
-
-    sub = risk[risk['主要问题'].str.contains('未招满', na=False)]
-    if not sub.empty:
-        items.append({
-            '类型': '编制未招满',
-            '标题': f"{len(sub)} 个已结束的岗位没有招满",
-            '涉及岗位': '、'.join(f"{r['岗位']}（需求 {_fmt_num(r['需求'])} 人，到位 {_fmt_num(r['入职'])} 人）"
-                                for _, r in sub.iterrows()),
-            '影响': '编制缺口仍然存在，业务可能需要继续分摊工作量',
-            '建议': '确认是继续补招还是先关闭岗位、调整用工方式',
-            '需要老板': '确认继续招（追加预算/时间）还是关闭岗位',
-            '严重度': 1,
-        })
-
-    sub = risk[risk['离职'] > 0]
-    if not sub.empty:
-        items.append({
-            '类型': '新人留存',
-            '标题': f"{len(sub)} 个岗位出现入职后离职（共 {_fmt_num(sub['离职'].sum())} 人）",
-            '涉及岗位': '、'.join(f"{r['岗位']}（离职 {_fmt_num(r['离职'])} 人）" for _, r in sub.iterrows()),
-            '影响': '招到又走，等于重复付出招聘成本，还会占用新的编制',
-            '建议': '复盘入职引导与岗位预期管理，必要时回访离职人员',
-            '需要老板': '是否需要推动用人部门做新人留任复盘',
-            '严重度': 1,
-        })
-
-    return sorted(items, key=lambda x: -x['严重度'])
-
-
-def _dashboard_decisions(d, ana, target_days):
-    """第二屏：需要老板拍板 / 给资源的事。"""
-    st.subheader('二、需要你拍板的事')
-    items = _decision_items(d, ana, target_days)
-    if not items:
-        st.success('✅ 没有需要你决策的事项，招聘节奏正常。')
+    if tab.empty:
+        st.info('当前筛选条件下没有岗位数据。')
         return
-    st.caption('这里不是岗位清单，而是把同类问题合并后，需要你决定或给资源的事（按影响大小排序）。')
-    for i, it in enumerate(items, 1):
-        with st.container(border=True):
-            st.markdown(f"**{i}. 【{it['类型']}】{it['标题']}**")
-            st.markdown(f"- 🎯 涉及岗位：{it['涉及岗位']}")
-            st.markdown(f"- 📉 影响：{it['影响']}")
-            st.markdown(f"- 🛠 建议：{it['建议']}")
-            st.markdown(f"- 🙋 **需要你**：{it['需要老板']}")
 
-    risk = ana[ana['问题数'] > 0].sort_values(['严重度'], ascending=False)
-    with st.expander('📋 这些岗位的完整数据（点开核对）', expanded=False):
-        cols = ['岗位', '部门', '状态', '周期(天)', '目标(天)', '同类中位(天)', '需求', '简历', '面试', '通过',
-                'Offer', '入职', '简历→面试%', '面试→通过%', 'Offer→入职%', '主要卡点', '主要问题']
-        show = risk[[c for c in cols if c in risk.columns]]
-        st.dataframe(show, width='stretch', hide_index=True, height=min(120 + 36 * len(show), 420),
-                     column_config={'周期(天)': st.column_config.NumberColumn('周期(天)', format='%.0f'),
-                                    '目标(天)': st.column_config.NumberColumn('目标(天)', format='%.0f'),
-                                    '同类中位(天)': st.column_config.NumberColumn('同类中位(天)', format='%.0f'),
-                                    '简历→面试%': st.column_config.NumberColumn('简历→面试%', format='%.1f'),
-                                    '面试→通过%': st.column_config.NumberColumn('面试→通过%', format='%.1f'),
-                                    'Offer→入职%': st.column_config.NumberColumn('Offer→入职%', format='%.1f')})
-        st.caption('异常判定：在招超过目标周期；已完成/暂停岗位周期超过目标或明显慢于同类中位；'
-                   '简历→面试 <10%（简历≥10 份）、面试通过率 <30%（面试≥5 人）、Offer→入职 <80%、有离职、编制未招满。')
+    cols = ['岗位', '部门', '类目', '状态', '需求', '入职', '缺口', '周期(天)', '简历', '面试', '通过',
+            'Offer', '离职', '现存', '留存%', '简历→面试%', '面试→通过%', 'Offer→入职%', '标注']
+    show = tab[[c for c in cols if c in tab.columns]].reset_index(drop=True)
+    for c in ('需求', '入职', '缺口', '周期(天)', '简历', '面试', '通过', 'Offer', '离职', '现存'):
+        if c in show.columns:
+            show[c] = show[c].apply(lambda v: round(_num(v), 1) if _num(v) == _num(v) else None)
+
+    def _hl(row):
+        bad = bool(str(row.get('标注', '')).strip())
+        return ['background-color: #fff2f2' if bad else '' for _ in row]
+
+    try:
+        st.dataframe(show.style.apply(_hl, axis=1), width='stretch', hide_index=True,
+                     height=min(120 + 34 * len(show), 520))
+    except Exception:
+        st.dataframe(show, width='stretch', hide_index=True, height=min(120 + 34 * len(show), 520))
+    st.caption(f'红底行 = 有自动标注。当前共 {len(tab)} 个岗位，其中 {int((tab["问题数"] > 0).sum())} 个有标注。'
+               f'　排序：在招 → 暂停 → 已完成；缺口 = 需求 − 入职；留存% = （入职 − 离职）÷ 入职。')
+
+    with st.expander('标注口径与自查方向（可选）', expanded=False):
+        st.markdown(
+            f'- **超期**：在招岗位已招天数 > 目标周期（{target_days:.0f} 天）→ 自查：简历量、面试排期、用人部门决策\n'
+            '- **周期偏长**：已完成/暂停岗位周期超过目标，或明显慢于同类岗位中位 → 自查：时间花在哪一环\n'
+            '- **简历转化低**：简历→面试 <10%（简历≥10 份）→ 自查：渠道质量、硬性条件是否过严\n'
+            '- **面试通过低**：面试通过率 <30%（面试≥5 人）→ 自查：面试标准与岗位画像是否一致\n'
+            '- **Offer 流失**：Offer→入职 <80% → 自查：薪资竞争力、Offer 到岗间隔\n'
+            '- **编制未招满 / 离职**：到位低于需求、或出现入职后离职 → 自查：需求合理性、新人融入')
 
 
 def _dashboard_progress(d, ana, target_days):
@@ -1065,8 +1036,8 @@ def _dashboard_progress(d, ana, target_days):
 
 
 def _dashboard_efficiency(d, ana, target_days):
-    """第四屏：效率 —— 时间和简历花在哪、每环流失多少。"""
-    st.subheader('四、效率与瓶颈')
+    """第四屏：转化与留存 —— 每环转化/流失多少、入职后留下了多少。"""
+    st.subheader('四、转化与留存')
     c1, c2 = st.columns([3, 2])
     with c1:
         st.plotly_chart(du.build_funnel_fig(d), width='stretch')
@@ -1112,6 +1083,21 @@ def _dashboard_efficiency(d, ana, target_days):
     bar2.update_layout(height=380, margin=dict(t=10, b=10, l=10, r=10), legend_title_text='',
                        paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
     st.plotly_chart(bar2, width='stretch')
+
+    st.markdown('**人员留存：入职 / 离职 / 现存**')
+    ret = d.groupby('department').agg(入职=('onboarded', 'sum'), 离职=('left', 'sum'),
+                                      现存=('current_headcount', 'sum')).reset_index()
+    ret['留存%'] = ret.apply(
+        lambda r: round((r['入职'] - r['离职']) / r['入职'] * 100, 1) if r['入职'] else float('nan'), axis=1)
+    ret = ret.rename(columns={'department': '公司/部门'}).sort_values('入职', ascending=False)
+    st.dataframe(ret, width='stretch', hide_index=True)
+    left_pos = ana[ana['离职'] > 0]
+    if left_pos.empty:
+        st.caption('当前没有岗位出现入职后离职。留存% =（入职 − 离职）÷ 入职；现存人数为最后一次记录的在场人数。')
+    else:
+        st.caption('出现离职的岗位：'
+                   + '、'.join(f"{r['岗位']}（入职 {_fmt_num(r['入职'])} · 离职 {_fmt_num(r['离职'])} · "
+                               f"现存 {_fmt_num(r['现存'])}）" for _, r in left_pos.iterrows()))
 
 
 def _dashboard_trend(d):
@@ -1234,10 +1220,10 @@ def page_dashboard():
     target_days = float(target_days)
     ana = _position_analysis(d, target_days, float(slow_ratio))
     _save_snapshot(d)                                  # 每天第一次打开自动记一条快照
-    _dashboard_summary(d, ana, target_days)            # 一、结论
-    _dashboard_decisions(d, ana, target_days)          # 二、需要你拍板的事
+    _dashboard_summary(d, ana, target_days)            # 一、总览（含在招岗位与自动标注统计）
+    _dashboard_positions(d, ana, only_risk, target_days)   # 二、岗位全景（自动标注）
     _dashboard_progress(d, ana, target_days)           # 三、进度：谁快谁慢
-    _dashboard_efficiency(d, ana, target_days)         # 四、效率与瓶颈
+    _dashboard_efficiency(d, ana, target_days)         # 四、转化与留存
     _dashboard_trend(d)                                # 五、变化：跟上次比
     _dashboard_detail(d, ana, only_risk)               # 六、明细（折叠）
 
