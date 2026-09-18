@@ -275,6 +275,26 @@ def _use_company_as_department(cols):
         pass
 
 
+def _clean_any(df):
+    """统一清洗入口：兼容「公司」列名、去重列名，任何上传文件都不会把页面搞崩。"""
+    try:
+        work = df.copy()
+    except Exception:
+        work = df
+    try:
+        if '公司' in list(work.columns) and '部门' not in list(work.columns):
+            work = work.rename(columns={'公司': '部门'})
+        clean = du.clean_raw(work)
+    except Exception:
+        clean = work
+    try:
+        if clean.columns.duplicated().any():
+            clean = clean.loc[:, ~clean.columns.duplicated()]
+    except Exception:
+        pass
+    return clean
+
+
 def _dashboard_rows():
     """看板数据在会话内缓存一份，避免每次 rerun 都去读云端。"""
     if '_dash_rows' not in st.session_state:
@@ -291,9 +311,8 @@ def _durable_load_current_data():
     """看板读数据：优先持久层，取不到再走 data_utils 原本的逻辑（内置 Excel / 本地文件）。"""
     rows = _dashboard_rows()
     if rows:
-        _use_company_as_department(rows[0].keys() if isinstance(rows[0], dict) else [])
         try:
-            return du.clean_raw(pd.DataFrame(rows))
+            return _clean_any(pd.DataFrame(rows))
         except Exception:
             pass
     try:
@@ -311,7 +330,7 @@ def _durable_save_store(df):
     st.session_state['_dash_rows'] = rows
     kv_set(DASH_KEY, rows)
     try:
-        _save_snapshot(du.clean_raw(df), force=True)
+        _save_snapshot(_clean_any(df), force=True)
     except Exception:
         pass
 
@@ -353,7 +372,8 @@ def _norm_pos(p, source=None):
 
 
 def _builtin_positions():
-    return [_norm_pos(p, '内置') for p in mt.JD_POSITIONS]
+    """不再预置任何 JD：岗位库完全由使用者自己新增 / 上传。"""
+    return []
 
 
 def _legacy_custom_positions():
@@ -368,31 +388,26 @@ def _legacy_custom_positions():
 
 
 def load_positions():
-    """岗位库 = 内置岗位（可删、可恢复）+ 自定义岗位，全部来自持久层。"""
+    """岗位库完全来自持久层（使用者自己新增 / 上传的 JD），不再预置内置岗位。"""
     deleted_list = sorted(set(kv_get(DEL_KEY, []) or []))
     st.session_state['deleted_builtins'] = deleted_list
     deleted = set(deleted_list)
     stored = kv_get(POS_KEY, None)
-    need_save = False
     if isinstance(stored, list) and stored:
         positions = [_norm_pos(p) for p in stored]
     else:
-        positions = _builtin_positions()
-        need_save = True
+        positions = []
+    # 清掉旧版本内置的 JD，只保留使用者自己加的
+    kept = [p for p in positions if p.get('source') != '内置']
+    need_save = len(kept) != len(positions)
+    positions = kept
     have = {p['name'] for p in positions}
     for p in _legacy_custom_positions():
         if p['name'] not in have:
             positions.append(p)
             have.add(p['name'])
             need_save = True
-    for p in _builtin_positions():          # 代码里新增的内置岗位自动补齐
-        if p['name'] not in have and p['name'] not in deleted:
-            positions.append(p)
-            have.add(p['name'])
-            need_save = True
-    out = [p for p in positions if not (p['source'] == '内置' and p['name'] in deleted)]
-    if len(out) != len(positions):
-        need_save = True
+    out = [p for p in positions if p.get('source') != '内置']
     if need_save:
         kv_set(POS_KEY, out)
     return out
@@ -551,31 +566,38 @@ def _data_manage():
             except Exception as e:
                 st.error(f'读取失败：{e}')
             else:
-                _use_company_as_department(new_raw.columns)
-                if mode == '覆盖全部':
-                    du.save_store(du.clean_raw(new_raw))
-                    st.success(f'已覆盖：共 {len(new_raw)} 行数据。')
-                else:
-                    merged, added, updated = du.merge_dataframes(du.load_current_data(), new_raw)
-                    du.save_store(merged)
-                    st.success(f'合并完成：新增 {added} 行，更新 {updated} 行，现有共 {len(merged)} 行。'
-                               f'（按 岗位+部门+招聘起 匹配，同一条目以新文件为准）')
-                st.rerun()
+                try:
+                    if '公司' in list(new_raw.columns) and '部门' not in list(new_raw.columns):
+                        new_raw = new_raw.rename(columns={'公司': '部门'})
+                    if mode == '覆盖全部':
+                        du.save_store(_clean_any(new_raw))
+                        st.success(f'已覆盖：共 {len(new_raw)} 行数据。')
+                    else:
+                        merged, added, updated = du.merge_dataframes(du.load_current_data(), new_raw)
+                        du.save_store(_clean_any(merged))
+                        st.success(f'合并完成：新增 {added} 行，更新 {updated} 行，现有共 {len(merged)} 行。'
+                                   f'（按 岗位+部门+招聘起 匹配，同一条目以新文件为准）')
+                    st.rerun()
+                except Exception as e:
+                    st.error(f'这份文件没能读进来：{e}。请检查表头是否包含「岗位 / 公司(或部门) / 当前状态」等列，'
+                             '或把文件另存为 .xlsx 后再试。')
 
     st.markdown('**② 在线增删改数据（加行/删行/改单元格后点保存）**')
-    editor_df = du.load_editor_data()
-    edited = st.data_editor(
-        du.to_display(editor_df),
-        num_rows='dynamic',
-        key='data_editor',
-        column_config=_editor_column_config(editor_df),
-        width='stretch',
-        height=380,
-        hide_index=True,
-    )
+    editor_df = _clean_any(du.load_editor_data())
+    display_df = du.to_display(editor_df)
+    if display_df.columns.duplicated().any():
+        display_df = display_df.loc[:, ~display_df.columns.duplicated()]
+    cfg = {k: v for k, v in _editor_column_config(editor_df).items() if k in list(display_df.columns)}
+    try:
+        edited = st.data_editor(display_df, num_rows='dynamic', key='data_editor', column_config=cfg,
+                                width='stretch', height=380, hide_index=True)
+    except Exception as e:
+        st.caption(f'表格编辑暂不可用（{e}），已改为只读预览；可先下载修正后再上传。')
+        st.dataframe(display_df, width='stretch', height=380, hide_index=True)
+        edited = display_df
     if st.button('💾 保存编辑', type='primary', key='save_edit'):
         back = du.from_display(edited)
-        du.save_store(_fix_editor_types(back))
+        du.save_store(_clean_any(_fix_editor_types(back)))
         st.success('已保存，图表与明细已同步刷新。')
         st.rerun()
 
@@ -938,12 +960,27 @@ def _dashboard_summary(d, ana, target_days):
         op = op.sort_values('周期(天)', ascending=True).copy()
         op['距目标剩余'] = (target_days - op['周期(天)']).clip(lower=0)
         op['颜色'] = op['标注'].apply(lambda s: '#e05c5c' if s else '#4c8bf5')
+        op['招聘起txt'] = pd.to_datetime(op['招聘起'], errors='coerce').dt.date.astype(str).replace('NaT', '—')
+        card = pd.DataFrame({
+            '公司': op['部门'].astype(str),
+            '招聘起': op['招聘起txt'],
+            '需求': op['需求'].apply(lambda v: _fmt_num(v)),
+            '已入职': op['入职'].apply(lambda v: _fmt_num(v)),
+            '简历': op['简历'].apply(lambda v: _fmt_num(v)),
+            '面试': op['面试'].apply(lambda v: _fmt_num(v)),
+            '状态说明': op['标注'].replace('', '正常'),
+        }).values
         fig = go.Figure()
         fig.add_trace(go.Bar(y=op['岗位'], x=op['距目标剩余'], orientation='h',
                              name=f'距目标剩余（目标 {target_days:.0f} 天）', marker_color='#e8eef7',
                              hoverinfo='skip'))
         fig.add_trace(go.Bar(y=op['岗位'], x=op['周期(天)'], orientation='h', name='已招天数',
-                             marker_color=op['颜色'],
+                             marker_color=op['颜色'], customdata=card,
+                             hovertemplate=('<b>%{y}</b><br>公司：%{customdata[0]}　招聘起：%{customdata[1]}'
+                                            '<br>已招：%{x} 天（目标 ' + f'{target_days:.0f}' + ' 天）'
+                                            '<br>需求 %{customdata[2]} 人 · 已入职 %{customdata[3]} 人'
+                                            '<br>简历 %{customdata[4]} 份 · 面试 %{customdata[5]} 人'
+                                            '<br>%{customdata[6]}<extra></extra>'),
                              text=[f"{_fmt_num(v)} 天" for v in op['周期(天)']], textposition='inside'))
         fig.update_layout(barmode='stack', height=max(240, 46 * len(op)), margin=dict(t=10, b=10, l=10, r=10),
                           legend=dict(orientation='h', y=1.12), xaxis_title='天',
@@ -975,6 +1012,9 @@ def _dashboard_monthly(d):
     don = don[don['status'] == '完成招聘']
     done_cnt = don.groupby('结束月').size()
     done_cyc = don.groupby('结束月')['duration_days'].mean()
+    new_names = tmp[tmp['开始月'].notna()].groupby(tmp['开始月'].astype(str).where(tmp['开始月'].notna()))[
+        'position'].apply(lambda s: '、'.join(str(x) for x in s))
+    done_names = don.groupby(don['结束月'].astype(str))['position'].apply(lambda s: '、'.join(str(x) for x in s))
     months = sorted(str(m) for m in (set(new.index) | set(done_cnt.index)))
     if not months:
         st.info('数据里没有可用的「招聘起 / 招聘止」日期，暂时画不出月度趋势。')
@@ -983,12 +1023,21 @@ def _dashboard_monthly(d):
     hist['新增岗位'] = hist['月份'].map({str(k): v for k, v in new.items()}).fillna(0).astype(int)
     hist['完成岗位'] = hist['月份'].map({str(k): v for k, v in done_cnt.items()}).fillna(0).astype(int)
     hist['完成岗位平均周期'] = hist['月份'].map({str(k): v for k, v in done_cyc.items()}).round(1)
+    hist['新增名单'] = hist['月份'].map({str(k): v for k, v in new_names.items()}).fillna('—')
+    hist['完成名单'] = hist['月份'].map({str(k): v for k, v in done_names.items()}).fillna('—')
 
     fig = go.Figure()
-    fig.add_trace(go.Bar(x=hist['月份'], y=hist['新增岗位'], name='新增岗位（按招聘起）', marker_color='#4c8bf5'))
-    fig.add_trace(go.Bar(x=hist['月份'], y=hist['完成岗位'], name='完成岗位（按招聘止）', marker_color='#2e9e6b'))
+    fig.add_trace(go.Bar(x=hist['月份'], y=hist['新增岗位'], name='新增岗位（按招聘起）', marker_color='#4c8bf5',
+                         customdata=hist[['新增名单']].values,
+                         hovertemplate='<b>%{x} 新增 %{y} 个岗位</b><br>%{customdata[0]}<extra></extra>'))
+    fig.add_trace(go.Bar(x=hist['月份'], y=hist['完成岗位'], name='完成岗位（按招聘止）', marker_color='#2e9e6b',
+                         customdata=hist[['完成名单']].values,
+                         hovertemplate='<b>%{x} 完成 %{y} 个岗位</b><br>%{customdata[0]}<extra></extra>'))
     fig.add_trace(go.Scatter(x=hist['月份'], y=hist['完成岗位平均周期'], name='完成岗位平均周期(天)',
-                             yaxis='y2', mode='lines+markers', line=dict(color='#e07b39', width=3)))
+                             yaxis='y2', mode='lines+markers', line=dict(color='#e07b39', width=3),
+                             customdata=hist[['完成名单']].values,
+                             hovertemplate='<b>%{x}</b><br>完成岗位平均 %{y:.1f} 天'
+                                           '<br>%{customdata[0]}<extra></extra>'))
     fig.update_layout(barmode='group', height=360, margin=dict(t=30, b=10, l=10, r=10),
                       yaxis=dict(title='岗位数'), yaxis2=dict(title='天', overlaying='y', side='right'),
                       legend=dict(orientation='h', y=1.15),
@@ -1007,16 +1056,28 @@ def _dashboard_progress(d, ana, target_days):
         st.markdown('**各公司岗位状态分布**')
         cnt = d.groupby(['department', 'status']).size().reset_index(name='岗位数')
         cnt = cnt.rename(columns={'department': '公司/部门', 'status': '状态'})
+        names = d.groupby(['department', 'status'])['position'].apply(
+            lambda s: '、'.join(str(x) for x in s)).reset_index(name='岗位名单')
+        names = names.rename(columns={'department': '公司/部门', 'status': '状态'})
+        cnt = cnt.merge(names, on=['公司/部门', '状态'], how='left')
         fig = px.bar(cnt, x='公司/部门', y='岗位数', color='状态', barmode='stack', text='岗位数',
-                     color_discrete_map={s: du.status_label(s) for s in du.STATUS_ORDER})
+                     color_discrete_map={s: du.status_label(s) for s in du.STATUS_ORDER},
+                     custom_data=['岗位名单'])
+        fig.update_traces(hovertemplate='<b>%{x} · %{fullData.name}</b><br>%{y} 个岗位<br>%{customdata[0]}'
+                                        '<extra></extra>')
         fig.update_layout(height=340, margin=dict(t=10, b=10, l=10, r=10), legend=dict(orientation='h', y=1.15),
                           paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
         st.plotly_chart(fig, width='stretch')
     with c2:
         st.markdown('**招聘类目分布**')
         cat = d['category'].fillna('未分类').value_counts()
-        pie = px.pie(values=cat.values, names=cat.index, hole=0.45)
-        pie.update_traces(textinfo='label+value')
+        cat_names = d.groupby(d['category'].fillna('未分类'))['position'].apply(
+            lambda s: '、'.join(str(x) for x in s))
+        catdf = pd.DataFrame({'类目': cat.index, '岗位数': cat.values,
+                              '岗位名单': [cat_names.get(k, '—') for k in cat.index]})
+        pie = px.pie(catdf, values='岗位数', names='类目', hole=0.45, custom_data=['岗位名单'])
+        pie.update_traces(textinfo='label+value',
+                          hovertemplate='<b>%{label}</b><br>%{value} 个岗位<br>%{customdata[0]}<extra></extra>')
         pie.update_layout(height=340, margin=dict(t=10, b=10, l=10, r=10), showlegend=False,
                           paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
         st.plotly_chart(pie, width='stretch')
@@ -1030,12 +1091,21 @@ def _dashboard_progress(d, ana, target_days):
     agg['缺口'] = (agg['需求'] - agg['到位']).clip(lower=0)
     agg['达成率%'] = (agg['到位'] / agg['需求'] * 100).round(0)
     agg = agg.rename(columns={'department': '公司/部门'}).sort_values('达成率%', ascending=False)
+    gap_detail = {}
+    for dept, g in dd.groupby('department'):
+        miss = g[g['onboarded'].fillna(0) < g['demand_max'].fillna(0)]
+        gap_detail[dept] = '、'.join(
+            f"{r['position']}（{_fmt_num(r['demand_max'])}→{_fmt_num(r['onboarded'])}）"
+            for _, r in miss.iterrows()) or '—'
+    agg['缺口岗位'] = agg['公司/部门'].map(gap_detail).fillna('—')
     st.dataframe(agg, width='stretch', hide_index=True)
     bar = go.Figure()
     bar.add_trace(go.Bar(y=agg['公司/部门'], x=agg['到位'], orientation='h', name='已到位', marker_color='#2e9e6b',
-                         text=agg['到位'], textposition='inside'))
+                         text=agg['到位'], textposition='inside',
+                         hovertemplate='<b>%{y}</b><br>已到位 %{x} 人<extra></extra>'))
     bar.add_trace(go.Bar(y=agg['公司/部门'], x=agg['缺口'], orientation='h', name='缺口', marker_color='#e05c5c',
-                         text=agg['缺口'], textposition='inside'))
+                         text=agg['缺口'], textposition='inside', customdata=agg[['缺口岗位']].values,
+                         hovertemplate='<b>%{y}</b><br>缺口 %{x} 人<br>未到位：%{customdata[0]}<extra></extra>'))
     bar.update_layout(barmode='stack', height=max(260, 40 * len(agg)), margin=dict(t=10, b=10, l=10, r=10),
                       legend=dict(orientation='h', y=1.15), xaxis_title='人数',
                       paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
@@ -1057,11 +1127,21 @@ def _dashboard_efficiency(d, ana, target_days):
     onb = _num(base['onboarded'].fillna(0).sum())
     c1, c2 = st.columns([3, 2])
     with c1:
+        def _top_by(col, n=6):
+            part = base[['position', col]].copy()
+            part[col] = pd.to_numeric(part[col], errors='coerce').fillna(0)
+            part = part[part[col] > 0].sort_values(col, ascending=False)
+            return '、'.join(str(x) for x in part['position'].head(n)) or '—'
+
         funnel = go.Figure(go.Funnel(
             y=['收简历', '进面试', '面试通过', '发 Offer', '入职'],
             x=[res, itv, pss, off, onb],
             textinfo='value+percent initial',
-            marker={'color': ['#4c8bf5', '#36b37e', '#ffb020', '#ff7452', '#8f6ef0']}))
+            marker={'color': ['#4c8bf5', '#36b37e', '#ffb020', '#ff7452', '#8f6ef0']},
+            customdata=[[_top_by('resumes')], [_top_by('interviewed')], [_top_by('passed')],
+                        [_top_by('offer')], [_top_by('onboarded')]],
+            hovertemplate='<b>%{y}</b><br>%{x:.0f} 人（占初始 %{percentInitial}）'
+                          '<br>主要岗位：%{customdata[0]}<extra></extra>'))
         funnel.update_layout(margin=dict(l=10, r=10, t=20, b=10), height=340,
                              paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
         st.plotly_chart(funnel, width='stretch')
@@ -1109,22 +1189,35 @@ def _dashboard_efficiency(d, ana, target_days):
     c3, c4 = st.columns(2)
     with c3:
         st.markdown('**周期分布（每个点=1 个完成岗位）**')
-        hist_fig = px.histogram(done, x='周期(天)', nbins=10, text_auto=True)
+        bins = pd.cut(done['周期(天)'], bins=min(8, max(3, done['周期(天)'].nunique())), include_lowest=True)
+        grp = done.groupby(bins, observed=True)
+        labels = [f'{int(iv.left)}–{int(iv.right)} 天' for iv in grp.size().index]
+        counts = grp.size().values
+        bin_names = ['、'.join(str(x) for x in g['岗位']) for _, g in grp]
         avg = _num(done['周期(天)'].mean())
         med = _num(done['周期(天)'].median())
+        hist_fig = go.Figure(go.Bar(x=labels, y=counts, customdata=[[n] for n in bin_names],
+                                    marker_color='#4c8bf5',
+                                    hovertemplate='<b>%{x}</b><br>%{y} 个岗位<br>%{customdata[0]}<extra></extra>'))
         if avg == avg:
             hist_fig.add_vline(x=avg, line_dash='dot', line_color='#e07b39', annotation_text=f'平均 {avg:.1f} 天')
         if med == med:
             hist_fig.add_vline(x=med, line_dash='dash', line_color='#2e9e6b', annotation_text=f'中位 {med:.0f} 天')
-        hist_fig.update_layout(height=320, margin=dict(t=30, b=10, l=10, r=10),
+        hist_fig.update_layout(height=320, margin=dict(t=30, b=10, l=10, r=10), xaxis_title='周期',
+                               yaxis_title='岗位数',
                                paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
         st.plotly_chart(hist_fig, width='stretch')
     with c4:
         st.markdown('**各公司平均周期**')
         bydept = done.groupby('部门').agg(完成岗位=('岗位', 'count'), 平均周期=('周期(天)', 'mean')).reset_index()
         bydept['平均周期'] = bydept['平均周期'].round(1)
+        dept_names = done.groupby('部门')['岗位'].apply(lambda s: '、'.join(str(x) for x in s)).to_dict()
+        bydept['岗位名单'] = bydept['部门'].map(dept_names).fillna('—')
         bar = px.bar(bydept.sort_values('平均周期'), x='平均周期', y='部门', orientation='h',
-                     text='平均周期', color='平均周期', color_continuous_scale='YlOrRd')
+                     text='平均周期', color='平均周期', color_continuous_scale='YlOrRd',
+                     custom_data=['岗位名单', '完成岗位'])
+        bar.update_traces(hovertemplate='<b>%{y}</b><br>平均 %{x:.1f} 天 · 完成 %{customdata[1]} 个岗位'
+                                        '<br>%{customdata[0]}<extra></extra>')
         bar.update_layout(height=320, margin=dict(t=30, b=10, l=10, r=10), showlegend=False,
                           coloraxis_showscale=False,
                           paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
@@ -1132,7 +1225,11 @@ def _dashboard_efficiency(d, ana, target_days):
 
     st.markdown('**每个已完成岗位的周期**')
     cyc = done.sort_values('周期(天)', ascending=True)
-    bar2 = px.bar(cyc, x='周期(天)', y='岗位', orientation='h', text='周期(天)', color='部门')
+    bar2 = px.bar(cyc, x='周期(天)', y='岗位', orientation='h', text='周期(天)', color='部门',
+                  custom_data=['部门', '需求', '入职', '简历', '面试'])
+    bar2.update_traces(hovertemplate='<b>%{y}</b>（%{customdata[0]}）<br>周期 %{x:.0f} 天'
+                                     '<br>需求 %{customdata[1]} · 入职 %{customdata[2]}'
+                                     '<br>简历 %{customdata[3]} · 面试 %{customdata[4]}<extra></extra>')
     bar2.add_vline(x=target_days, line_dash='dash', line_color='#888',
                    annotation_text=f'目标 {target_days:.0f} 天', annotation_position='top')
     bar2.update_layout(height=380, margin=dict(t=30, b=10, l=10, r=10), legend_title_text='',
@@ -1164,11 +1261,22 @@ def _dashboard_retention(d, ana):
         if chart.empty:
             st.info('暂无可统计的入职数据。')
         else:
+            left_names = {}
+            for dept, g in d.groupby('department'):
+                lf = g[g['left'].fillna(0) > 0]
+                left_names[dept] = '、'.join(
+                    f"{r['position']}（离职 {_fmt_num(r['left'])}）" for _, r in lf.iterrows()) or '—'
+            chart = chart.copy()
+            chart['离职岗位'] = chart['公司/部门'].map(left_names).fillna('—')
             fig = go.Figure()
-            fig.add_trace(go.Bar(x=chart['公司/部门'], y=chart['入职'], name='入职', marker_color='#2e9e6b'))
-            fig.add_trace(go.Bar(x=chart['公司/部门'], y=chart['离职'], name='离职', marker_color='#e05c5c'))
+            fig.add_trace(go.Bar(x=chart['公司/部门'], y=chart['入职'], name='入职', marker_color='#2e9e6b',
+                                 hovertemplate='<b>%{x}</b><br>入职 %{y} 人<extra></extra>'))
+            fig.add_trace(go.Bar(x=chart['公司/部门'], y=chart['离职'], name='离职', marker_color='#e05c5c',
+                                 customdata=chart[['离职岗位']].values,
+                                 hovertemplate='<b>%{x}</b><br>离职 %{y} 人<br>%{customdata[0]}<extra></extra>'))
             fig.add_trace(go.Scatter(x=chart['公司/部门'], y=chart['现存'], name='现存', mode='lines+markers',
-                                     line=dict(color='#4c8bf5', width=3)))
+                                     line=dict(color='#4c8bf5', width=3),
+                                     hovertemplate='<b>%{x}</b><br>现存 %{y} 人<extra></extra>'))
             fig.update_layout(barmode='group', height=340, margin=dict(t=30, b=10, l=10, r=10),
                               legend=dict(orientation='h', y=1.15), yaxis_title='人数',
                               paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
@@ -1315,6 +1423,82 @@ def page_dashboard():
 
 # ==================== 岗位匹配：①岗位信息 → ②批量上传 → ③智能打分 ====================
 
+def _parse_years(v):
+    try:
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return 0.0
+        s = ''.join(ch for ch in str(v) if ch.isdigit() or ch == '.')
+        return float(s) if s else 0.0
+    except Exception:
+        return 0.0
+
+
+def _split_list(v):
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return []
+    for sep in ('、', '，', ',', '；', ';', '/', '|'):
+        v = str(v).replace(sep, '\n')
+    return [x.strip() for x in str(v).split('\n') if x.strip()]
+
+
+def _bulk_import_positions(positions):
+    """批量导入 JD：上传一份岗位表，直接进岗位库。"""
+    with st.expander('📥 批量导入 JD（Excel / CSV）', expanded=False):
+        st.caption('表头支持：岗位名称（或 岗位）、部门（或 公司）、学历要求、经验要求、技能关键词、'
+                   '硬性条件、岗位描述（JD 原文）。同名的岗位会跳过，不会重复添加。')
+        up = st.file_uploader('选择 .xlsx / .xls / .csv', type=['xlsx', 'xls', 'csv'], key='jd_bulk')
+        if up is not None and st.button('导入到岗位库', key='jd_bulk_btn'):
+            try:
+                raw = pd.read_csv(up) if str(up.name).lower().endswith('.csv') else pd.read_excel(up)
+            except Exception as e:
+                st.error(f'读取失败：{e}')
+                return
+            alias = {'岗位': '岗位名称', '招聘岗位': '岗位名称', '公司': '部门', '岗位部门': '部门',
+                     '学历': '学历要求', '经验': '经验要求', '经验要求(年)': '经验要求',
+                     '关键词': '技能关键词', '技能': '技能关键词', 'JD': '岗位描述', '岗位JD': '岗位描述'}
+            raw = raw.rename(columns={str(c).strip(): alias.get(str(c).strip(), str(c).strip())
+                                      for c in raw.columns})
+            have = {p['name'] for p in positions}
+            added, skipped = 0, 0
+            for _, r in raw.iterrows():
+                name = str(r.get('岗位名称', '') or '').strip()
+                if not name or name.lower() == 'nan':
+                    continue
+                if name in have:
+                    skipped += 1
+                    continue
+                edu_txt = str(r.get('学历要求', '') or '')
+                edu = 0
+                for k, v in EDU_LEVEL.items():
+                    if k and k in edu_txt:
+                        edu = v
+                        break
+                desc = r.get('岗位描述', '')
+                kws = _split_list(r.get('技能关键词'))
+                if not kws and desc:
+                    try:
+                        kws = mt.parse_jd_keywords(str(desc))
+                    except Exception:
+                        kws = []
+                positions.append(_norm_pos({
+                    'name': name,
+                    'department': str(r.get('部门', '') or ''),
+                    'education': edu,
+                    'years': _parse_years(r.get('经验要求')),
+                    'keywords': kws,
+                    'hard_conditions': _split_list(r.get('硬性条件')),
+                    'description': '' if pd.isna(desc) else str(desc),
+                    'source': '自定义',
+                }))
+                have.add(name)
+                added += 1
+            if added:
+                save_positions(positions, deleted_builtins())
+            st.session_state['flash'] = (f'已导入 {added} 个岗位' + (f'，跳过重名 {skipped} 个' if skipped else '')
+                                         + '，共 ' + str(len(positions)) + ' 个岗位。')
+            st.rerun()
+
+
 def _position_manage(positions):
     """岗位库维护：删除任意岗位（内置也能删）、恢复内置岗位、备份与恢复。"""
     labels = [f"{mt.position_label(p)}　[{p.get('source', '')}]" for p in positions]
@@ -1413,9 +1597,9 @@ def _jd_manage(positions):
                 save_positions(positions, deleted_builtins())
                 st.success(f'已保存岗位「{name.strip()}」，共 {len(positions)} 个岗位。')
 
-    n_builtin = sum(1 for p in positions if p.get('source') == '内置')
-    st.markdown(f'**岗位库**（内置 {n_builtin} 个 · 自定义 {len(positions) - n_builtin} 个 · '
-                f'共 {len(positions)} 个，均可删除）')
+    _bulk_import_positions(positions)
+
+    st.markdown(f'**岗位库**（共 {len(positions)} 个，均为你自己新增 / 上传的，均可删除）')
     rows = [{
         '岗位名称': p['name'], '部门': p.get('department', ''),
         '学历要求': EDU_NAME.get(p.get('education', 0), '不限'),
@@ -1704,8 +1888,8 @@ def page_matching():
 
     positions = get_positions()
     if not positions:
-        st.warning('岗位库现在是空的：请展开「➕ 新增岗位」新建岗位，'
-                   '或点「♻️ 恢复全部已删除的内置岗位」把内置岗位找回来。')
+        st.info('岗位库还是空的：用下面的「📥 批量导入 JD」上传一份岗位表，'
+                '或者展开「➕ 新增岗位」粘贴 JD 新增一个。')
         return
 
     # ---------- 第 1 步：岗位信息 ----------
@@ -1713,7 +1897,7 @@ def page_matching():
     _jd_manage(positions)
 
     if not positions:
-        st.warning('岗位库现在是空的，请先新增岗位。')
+        st.info('岗位库还是空的，请先新增或导入岗位。')
         return
 
     sel = st.selectbox('本次匹配的岗位', position_options(positions), key='match_pos')
