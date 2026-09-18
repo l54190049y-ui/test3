@@ -232,6 +232,18 @@ def _storage_notice():
         st.warning(w)
 
 
+def _storage_badge():
+    """把存储状态收进侧边栏，主页面只放内容。"""
+    ok, _ = storage_status()
+    with st.sidebar:
+        if ok:
+            st.caption('🟢 数据已连接云端数据库，永久保存')
+        else:
+            st.caption('🟡 临时存储：应用重启后需导入备份（页面底部有开启永久保存的步骤）')
+        for w in st.session_state.pop('kv_errors', [])[:2]:
+            st.caption('⚠️ ' + w)
+
+
 # ---------------- 数据看板的数据也接进持久层（不用改 data_utils.py） ----------------
 
 def _looks_fresh_container():
@@ -924,7 +936,7 @@ def _dashboard_summary(d, ana, target_days):
     lv_cyc = 'green' if (cyc != cyc or cyc <= target_days) else ('amber' if cyc <= target_days * 1.3 else 'red')
     lv_retain = 'green' if (retain != retain or retain >= 90) else ('amber' if retain >= 80 else 'red')
 
-    st.subheader('一、总览')
+    st.subheader('关键指标')
     snaps_now = _snapshots()
     updated = snaps_now[-1].get('saved_at', '—') if snaps_now else '—'
     st.caption(f'数据截至 {m["date"]}　·　岗位 {len(d)} 个（在招 {m["在招"]} · 完成 '
@@ -1003,7 +1015,7 @@ def _dashboard_summary(d, ana, target_days):
 
 def _dashboard_monthly(d):
     """二、时间趋势：按月看新增岗位、完成岗位与完成岗位的平均周期。"""
-    st.subheader('二、时间趋势（按月）')
+    st.subheader('按月趋势')
     tmp = d.copy()
     tmp['开始月'] = pd.to_datetime(tmp['start_date'], errors='coerce').dt.to_period('M')
     tmp['结束月'] = pd.to_datetime(tmp['end_date'], errors='coerce').dt.to_period('M')
@@ -1049,7 +1061,7 @@ def _dashboard_monthly(d):
 
 def _dashboard_progress(d, ana, target_days):
     """三、组织结构：按公司/类目看分布，按公司看到位与缺口。"""
-    st.subheader('三、组织结构与达成')
+    st.subheader('公司 · 类目 · 达成')
 
     c1, c2 = st.columns([3, 2])
     with c1:
@@ -1115,7 +1127,7 @@ def _dashboard_progress(d, ana, target_days):
 
 def _dashboard_efficiency(d, ana, target_days):
     """四、转化漏斗（整体 + 各公司）；五、周期分析（只统计已完成岗位）。"""
-    st.subheader('四、转化漏斗')
+    st.subheader('转化漏斗')
     base = d[d['resumes'].notna()].copy()
     if base.empty:
         st.info('没有岗位填写「推送方简历数」，无法计算漏斗。')
@@ -1181,7 +1193,7 @@ def _dashboard_efficiency(d, ana, target_days):
     st.dataframe(pd.DataFrame(rows).sort_values('收简历', ascending=False),
                  width='stretch', hide_index=True)
 
-    st.subheader('五、周期分析')
+    st.subheader('周期分析')
     done = ana[(ana['状态'] == '完成招聘') & (ana['周期(天)'] == ana['周期(天)'])].copy()
     if done.empty:
         st.info('暂无已完成岗位的周期数据。')
@@ -1240,7 +1252,7 @@ def _dashboard_efficiency(d, ana, target_days):
 
 def _dashboard_retention(d, ana):
     """六、人员留存：入职 / 离职 / 现存，以及跟上次比的变化。"""
-    st.subheader('六、人员留存')
+    st.subheader('入职 · 离职 · 留存')
     ret = d.groupby('department').agg(入职=('onboarded', 'sum'), 离职=('left', 'sum'),
                                       现存=('current_headcount', 'sum')).reset_index()
     ret['留存%'] = ret.apply(
@@ -1344,7 +1356,7 @@ def _dashboard_detail(d, ana, only_risk, target_days):
     if only_risk:
         detail = detail[detail['待跟进'] > 0]
 
-    with st.expander('七、岗位明细（备查 / 导出）', expanded=False):
+    with st.expander('岗位明细（可导出）', expanded=False):
         if detail.empty:
             st.info('当前筛选范围内没有需要跟进的在招岗位。')
             return
@@ -1387,6 +1399,8 @@ def page_dashboard():
         sel_dept = st.multiselect('部门', depts, default=depts)
         cats = sorted(df['category'].dropna().unique().tolist())
         sel_cat = st.multiselect('招聘类目', cats, default=cats)
+        include_paused = st.checkbox('把暂停岗位也算进来', value=False, key='incl_paused',
+                                     help='默认不统计「暂停」的岗位，只看看在招和已完成。')
         st.subheader('基准设置')
         target_days = st.number_input('目标招聘周期（天）', min_value=5, max_value=180, value=30, step=5,
                                       key='target_days',
@@ -1397,6 +1411,8 @@ def page_dashboard():
 
     mask = (df['status'].isin(sel_status)) & (df['department'].isin(sel_dept)) & (df['category'].isin(sel_cat))
     d = df[mask].copy()
+    if not include_paused:
+        d = d[d['status'] != '暂停']
     if d.empty:
         st.warning('当前筛选条件下没有数据，请调整筛选。')
         return
@@ -1412,13 +1428,20 @@ def page_dashboard():
     target_days = float(target_days)
     ana = _position_analysis(d, target_days, float(slow_ratio))
     _save_snapshot(d)                                  # 每天第一次打开自动记一条快照
-    _dashboard_summary(d, ana, target_days)               # 一、总览（指标 + 在招岗位进度）
-    _dashboard_monthly(d)                                 # 二、时间趋势（按月）
-    _dashboard_progress(d, ana, target_days)              # 三、组织结构与达成
-    _dashboard_efficiency(d, ana, target_days)            # 四、转化漏斗 + 五、周期分析
-    _dashboard_retention(d, ana)                          # 六、人员留存
-    _dashboard_detail(d, ana, only_risk, target_days)     # 七、明细
-    _dashboard_export(d, ana, target_days)                # 导出（多表 Excel）
+    tabs = st.tabs(['📌 总览', '📈 时间趋势', '🏢 组织结构', '🔻 转化与周期', '👥 人员留存', '📋 岗位明细'])
+    with tabs[0]:
+        _dashboard_summary(d, ana, target_days)
+    with tabs[1]:
+        _dashboard_monthly(d)
+    with tabs[2]:
+        _dashboard_progress(d, ana, target_days)
+    with tabs[3]:
+        _dashboard_efficiency(d, ana, target_days)
+    with tabs[4]:
+        _dashboard_retention(d, ana)
+    with tabs[5]:
+        _dashboard_detail(d, ana, only_risk, target_days)
+        _dashboard_export(d, ana, target_days)
 
 
 # ==================== 岗位匹配：①岗位信息 → ②批量上传 → ③智能打分 ====================
@@ -1876,7 +1899,6 @@ def _setup_help():
 def page_matching():
     st.title('📄 岗位匹配：填写岗位 → 批量上传 → 智能打分')
     st.caption('一个流程走完：先维护岗位信息，再批量上传简历，最后 DeepSeek 智能分析打分排名（打分即筛选）。')
-    _storage_notice()
 
     if st.session_state.get('_reset_widgets'):      # 删除/恢复岗位后，重置下拉框选中项
         st.session_state['_reset_widgets'] = False
@@ -1887,17 +1909,13 @@ def page_matching():
         st.success(st.session_state.pop('flash'))
 
     positions = get_positions()
-    if not positions:
-        st.info('岗位库还是空的：用下面的「📥 批量导入 JD」上传一份岗位表，'
-                '或者展开「➕ 新增岗位」粘贴 JD 新增一个。')
-        return
 
     # ---------- 第 1 步：岗位信息 ----------
     st.markdown('#### ① 填写 / 选择岗位信息')
     _jd_manage(positions)
 
     if not positions:
-        st.info('岗位库还是空的，请先新增或导入岗位。')
+        st.info('岗位库是空的：请先在上面的「📥 批量导入 JD」上传岗位表，或展开「➕ 新增岗位」新增一个。')
         return
 
     sel = st.selectbox('本次匹配的岗位', position_options(positions), key='match_pos')
@@ -1995,6 +2013,7 @@ with st.sidebar:
     st.title('🎯 招聘 HR 工作台')
     page = st.radio('功能模块', list(pages.keys()), label_visibility='collapsed')
 st.sidebar.caption('智能打分调用 DeepSeek API（填 Key 后可用）；本地规则打分不依赖网络与 AI。')
+_storage_badge()
 
 if st.session_state.get('flash'):
     st.success(st.session_state.pop('flash'))
