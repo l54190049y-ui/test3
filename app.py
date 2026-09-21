@@ -1010,19 +1010,20 @@ def _dashboard_summary(d, ana, target_days):
                           legend=dict(orientation='h', y=1.12), xaxis_title='天',
                           paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
         st.plotly_chart(fig, width='stretch')
-        tab = op.copy()
-        tab['招聘起'] = pd.to_datetime(tab['招聘起'], errors='coerce').dt.date.astype(str).replace('NaT', '—')
-        tab['缺口'] = tab.apply(
+        src_open = d[d['status'] == '招聘中'].copy()
+        src_open['_k'] = src_open['position'].astype(str) + '||' + src_open['department'].astype(str)
+        opx = op.copy()
+        opx['_k'] = opx['岗位'].astype(str) + '||' + opx['部门'].astype(str)
+        opx['缺口'] = opx.apply(
             lambda r: max(_num(r['需求'], 0) - _num(r['入职'], 0), 0) if r['需求'] == r['需求'] else float('nan'),
             axis=1)
-        show = tab[['岗位', '部门', '招聘起', '周期(天)', '目标(天)', '需求', '缺口', '简历', '面试', '标注']]
-        show = show.rename(columns={'周期(天)': '已招天数', '目标(天)': '目标天数'})
-        st.dataframe(show, width='stretch', hide_index=True,
-                     column_config={'已招天数': st.column_config.NumberColumn('已招天数', format='%.0f'),
-                                    '目标天数': st.column_config.NumberColumn('目标天数', format='%.0f'),
-                                    '缺口': st.column_config.NumberColumn('缺口', format='%.0f')})
+        merged = src_open.merge(opx[['_k', '周期(天)', '目标(天)', '缺口', '标注']], on='_k', how='left')
+        _editable_table(merged, key='edit_open',
+                        extra_cols={'已招天数': merged['周期(天)'], '目标天数': merged['目标(天)'],
+                                    '缺口': merged['缺口'], '标注': merged['标注'].fillna('')})
         st.caption(f'在招 {len(op)} 个：超期 {overdue} 个、待跟进 {flagged} 个。'
-                   '蓝/红 = 已招天数（红=待跟进），浅灰 = 到目标周期还剩的天数。')
+                   '表格可以直接改（状态/招聘起/招聘止/需求/简历/面试/通过/Offer/入职/离职/现存），'
+                   '改完点「💾 保存表格修改」即可，刷新也在。')
 
 
 def _dashboard_monthly(d):
@@ -1359,6 +1360,9 @@ def _dashboard_export(d, ana, target_days):
 
 def _dashboard_detail(d, ana, only_risk, target_days):
     """七、岗位明细（备查与导出）。标注只针对在招岗位。"""
+    st.markdown('**在线编辑**（直接改表格里的数据，改完点保存，刷新也在）')
+    _editable_table(d.reset_index(drop=True), key='edit_all', height=400)
+    st.divider()
     detail = d.reset_index(drop=True)
     extra = ana[['周期(天)', '主要卡点']].copy()
     extra['标注'] = ana.apply(
@@ -1392,6 +1396,67 @@ def _dashboard_detail(d, ana, only_risk, target_days):
                  '招聘起', '招聘止']
         order += [ec for ec in du.extra_columns(d)]
         st.dataframe(disp[[c for c in order if c in disp.columns]], width='stretch', height=420, hide_index=True)
+
+
+EDIT_COLS = [('状态', 'status'), ('招聘起', 'start_date'), ('招聘止', 'end_date'), ('招聘需求', 'demand'),
+             ('推送简历', 'resumes'), ('面试', 'interviewed'), ('通过', 'passed'), ('Offer', 'offer'),
+             ('入职', 'onboarded'), ('离职', 'left'), ('现存', 'current_headcount')]
+
+
+def _editable_table(src, key, extra_cols=None, height=360):
+    """可直接在网页里改并保存的表格：保存后写进持久层，刷新也不会丢。"""
+    if src is None or len(src) == 0:
+        st.info('当前没有可编辑的数据。')
+        return
+    view = pd.DataFrame({'岗位': src['position'].astype(str), '部门': src['department'].astype(str)})
+    for cn, en in EDIT_COLS:
+        view[cn] = src[en] if en in src.columns else None
+    editable = ['岗位', '部门'] + [cn for cn, _ in EDIT_COLS]
+    for cn, vals in (extra_cols or {}).items():
+        view[cn] = list(vals)
+    cfg = {'岗位': st.column_config.TextColumn('岗位'), '部门': st.column_config.TextColumn('部门')}
+    for cn, en in EDIT_COLS:
+        if en == 'status':
+            cfg[cn] = st.column_config.SelectboxColumn(cn, options=du.STATUS_ORDER)
+        elif en in du.DATE_COLS:
+            cfg[cn] = st.column_config.DateColumn(cn)
+        elif en in du.NUMERIC_COLS:
+            cfg[cn] = st.column_config.NumberColumn(cn, format='%.0f')
+        else:
+            cfg[cn] = st.column_config.TextColumn(cn, help='可填 2-3 表示区间')
+    try:
+        edited = st.data_editor(view, key=key, num_rows='fixed', hide_index=True, height=height,
+                                column_config=cfg,
+                                disabled=[c for c in view.columns if c not in editable])
+    except Exception as e:
+        st.caption(f'表格暂时不可编辑（{e}），已改为只读显示。')
+        st.dataframe(view, width='stretch', hide_index=True, height=height)
+        return
+    if edited is None:
+        edited = view
+    if st.button('💾 保存表格修改', key=key + '_save'):
+        full = _clean_any(du.load_current_data()).reset_index(drop=True)
+        idx = {f"{r['position']}||{r['department']}": i for i, r in full.iterrows()}
+        changed = 0
+        for _, r in edited.reset_index(drop=True).iterrows():
+            k = f"{r['岗位']}||{r['部门']}"
+            if k not in idx:
+                continue
+            i = idx[k]
+            full.at[i, 'position'] = r['岗位']
+            full.at[i, 'department'] = r['部门']
+            for cn, en in EDIT_COLS:
+                v = r.get(cn)
+                if en in du.DATE_COLS:
+                    v = pd.to_datetime(v, errors='coerce')
+                elif en in du.NUMERIC_COLS:
+                    s = '' if v is None else str(v).strip()
+                    v = float('nan') if s in ('', 'None', 'nan', 'NaT') else _num(v)
+                full.at[i, en] = v
+            changed += 1
+        du.save_store(full)
+        st.session_state['flash'] = f'已保存 {changed} 个岗位的修改，图表已同步刷新。'
+        st.rerun()
 
 
 def _dashboard_projects(d):
@@ -1968,6 +2033,32 @@ def _history_ui():
     if not hist:
         st.info('还没有打分记录。上传简历后点「🚀 开始打分」，结果会自动保存到这里。')
         return
+
+    ledger = []
+    for r in hist:
+        for dt in (r.get('details') or []):
+            nm = dt.get('name') or '未识别'
+            ledger.append({'岗位': r.get('position', ''), '打分时间': r.get('time', ''),
+                           '姓名': nm, '电话': dt.get('phone') or '—',
+                           '学历': dt.get('education', ''), '经验': dt.get('years_raw', ''),
+                           '匹配分': dt.get('score'), '等级': _grade(dt.get('score')),
+                           '建议': dt.get('tag', ''),
+                           '跟进': (r.get('followup') or {}).get(str(nm), '')})
+    if ledger:
+        led = pd.DataFrame(ledger).sort_values('匹配分', ascending=False).reset_index(drop=True)
+        with st.expander(f'候选人台账（累计 {len(led)} 人次，刷新后仍在）', expanded=False):
+            st.dataframe(led, width='stretch', hide_index=True, height=min(160 + 34 * len(led), 520))
+            try:
+                buf = io.BytesIO()
+                with pd.ExcelWriter(buf, engine='openpyxl') as w:
+                    led.to_excel(w, index=False, sheet_name='候选人台账')
+                st.download_button('⬇️ 导出候选人台账 Excel', buf.getvalue(),
+                                   file_name=f"候选人台账_{pd.Timestamp.today().date()}.xlsx",
+                                   mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                                   key='ledger_xlsx')
+            except Exception:
+                st.download_button('下载候选人台账 CSV', led.to_csv(index=False).encode('utf-8-sig'),
+                                   file_name='候选人台账.csv', mime='text/csv', key='ledger_csv')
 
     ids = [r.get('id') for r in hist]
     labels = {r.get('id'): f"{r.get('time', '')} ｜ {r.get('position', '')} ｜ "
