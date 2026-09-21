@@ -20,13 +20,23 @@ st.set_page_config(page_title='招聘 HR 工作台', page_icon='📊', layout='w
 
 st.markdown("""
 <style>
-.block-container {padding-top: 1.2rem;}
+.block-container {padding-top: 1.4rem; max-width: 1500px;}
+#MainMenu, footer {visibility: hidden;}
+h1 {font-size: 1.9rem !important; letter-spacing: .2px;}
+h3 {font-size: 1.15rem !important; margin-top: .3rem;}
 [data-testid="stMetric"] {
-    border: 1px solid rgba(128, 128, 128, 0.25); border-radius: 10px;
-    padding: 12px 16px;
+    background: rgba(127, 127, 127, 0.06);
+    border: 1px solid rgba(127, 127, 127, 0.22);
+    border-radius: 14px; padding: 14px 16px;
 }
-div[data-testid="stMetricLabel"] {font-size: 0.9rem;}
-div[data-testid="stMetricValue"] {font-size: 1.6rem;}
+div[data-testid="stMetricLabel"] {font-size: 0.82rem; opacity: .75;}
+div[data-testid="stMetricValue"] {font-size: 1.5rem; font-weight: 650;}
+[data-testid="stMetricDelta"] {font-size: 0.78rem;}
+.stTabs [data-baseweb="tab-list"] {gap: 6px; border-bottom: 1px solid rgba(127,127,127,.2);}
+.stTabs [data-baseweb="tab"] {height: 40px; padding: 0 16px; border-radius: 10px 10px 0 0;}
+.stTabs [aria-selected="true"] {background: rgba(76,139,245,.12); font-weight: 600;}
+[data-testid="stExpander"] {border: 1px solid rgba(127,127,127,.2); border-radius: 12px;}
+section[data-testid="stSidebar"] {border-right: 1px solid rgba(127,127,127,.2);}
 </style>
 """, unsafe_allow_html=True)
 
@@ -943,27 +953,29 @@ def _dashboard_summary(d, ana, target_days):
                f"{int((d['status'] == '完成招聘').sum())} · 暂停 {int((d['status'] == '暂停').sum())}）"
                f'　·　最近更新时间 {updated}')
 
+    gap = max(_num(m['需求']) - _num(m['到位']), 0)
+    net = _num(m['入职']) - _num(m['离职'])
     c1 = st.columns(4)
-    c1[0].metric(f'{_health(lv_rate)} 需求到位率', _fmt_pct(rate, 0) if rate == rate else '—',
-                 _delta_txt(dv, '到位', ' 人') or f"{_fmt_num(m['到位'])}/{_fmt_num(m['需求'])} 人")
-    c1[1].metric(f'{_health(lv_open)} 在招岗位', f"{m['在招']} 个",
+    c1[0].metric('总岗位数', f'{len(d)} 个',
+                 f"在招 {int((d['status'] == '招聘中').sum())} · 完成 {int((d['status'] == '完成招聘').sum())}"
+                 + (f" · 暂停 {int((d['status'] == '暂停').sum())}" if int((d['status'] == '暂停').sum()) else ''),
+                 delta_color='off')
+    c1[1].metric(f'{_health(lv_open)} 招聘中', f"{m['在招']} 个",
                  (f'超期 {overdue} · 待跟进 {flagged}' if flagged else '进度正常'),
                  delta_color='inverse' if flagged else 'off')
-    c1[2].metric(f'{_health(lv_cyc)} 平均招聘周期', f'{_fmt_num(cyc, 1)} 天',
+    c1[2].metric('总需求人数', f"{_fmt_num(m['需求'])} 人", f'缺口 {_fmt_num(gap)} 人', delta_color='off')
+    c1[3].metric('平均招聘时长', f'{_fmt_num(cyc, 1)} 天',
                  _delta_txt(dv, '平均周期', ' 天', 1) or f'目标 {target_days:.0f} 天', delta_color='inverse')
-    c1[3].metric(f'{_health(lv_retain)} 入职留存率', _fmt_pct(retain, 0) if retain == retain else '—',
-                 _delta_txt(dv, '留存率', ' pt', 1) or
-                 f"入职 {_fmt_num(m['入职'])} · 离职 {_fmt_num(m['离职'])} · 现存 {_fmt_num(m['现存'])}",
-                 delta_color='inverse')
 
     c2 = st.columns(4)
-    c2[0].metric('收到简历', f"{_fmt_num(m['简历'])} 份", f'整体转化 {_fmt_pct(conv)}', delta_color='off')
-    c2[1].metric('进入面试', _fmt_num(d['interviewed'].fillna(0).sum()),
-                 f"面试率 {_fmt_pct(_pct(d['interviewed'].sum(), m['简历']))}", delta_color='off')
-    c2[2].metric('发出 Offer', _fmt_num(d['offer'].fillna(0).sum()),
-                 f"面试通过 {_fmt_num(d['passed'].fillna(0).sum())} 人", delta_color='off')
-    c2[3].metric('入职 / 缺口', f"{_fmt_num(m['入职'])} / {_fmt_num(max(_num(m['需求']) - _num(m['到位']), 0))}",
-                 f"需求 {_fmt_num(m['需求'])} 人", delta_color='off')
+    c2[0].metric('总入职人数', f"{_fmt_num(m['入职'])} 人",
+                 f'到位率 {_fmt_pct(rate, 0)}' if rate == rate else None, delta_color='off')
+    c2[1].metric('总离职人数', f"{_fmt_num(m['离职'])} 人", delta_color='off')
+    c2[2].metric(f'{_health(lv_retain)} 净留存', f'{_fmt_num(net)} 人',
+                 _delta_txt(dv, '留存率', ' pt', 1) or f'留存率 {_fmt_pct(retain, 0)}',
+                 delta_color='inverse')
+    c2[3].metric('简历→入职转化', _fmt_pct(conv) if conv == conv else '—',
+                 f"收到 {_fmt_num(m['简历'])} 份简历", delta_color='off')
 
     st.markdown('**在招岗位进度**（灰段 = 到目标周期还剩多少天）')
     if op.empty:
@@ -1382,6 +1394,80 @@ def _dashboard_detail(d, ana, only_risk, target_days):
         st.dataframe(disp[[c for c in order if c in disp.columns]], width='stretch', height=420, hide_index=True)
 
 
+def _dashboard_projects(d):
+    """公司卡片墙：每家公司一张卡，关键数字一眼看完。"""
+    st.subheader('各公司一览')
+    rows = []
+    for dept, g in d.groupby('department'):
+        demand = _num(g['demand_max'].fillna(0).sum())
+        onb = _num(g['onboarded'].fillna(0).sum())
+        done = g[g['status'] == '完成招聘']
+        rows.append({
+            '公司': dept, '岗位': int(len(g)),
+            '在招': int((g['status'] == '招聘中').sum()),
+            '完成': int((g['status'] == '完成招聘').sum()),
+            '暂停': int((g['status'] == '暂停').sum()),
+            '需求': demand, '入职': onb, '离职': _num(g['left'].fillna(0).sum()),
+            '缺口': max(demand - onb, 0),
+            '平均时长': _num(done['duration_days'].dropna().mean()) if not done.empty else float('nan'),
+            '转化率': _pct(onb, _num(g['resumes'].fillna(0).sum())),
+        })
+    if not rows:
+        st.info('暂无公司数据。')
+        return
+    cards = pd.DataFrame(rows).sort_values(['缺口', '岗位'], ascending=[False, False])
+    for i in range(0, len(cards), 3):
+        cols = st.columns(3)
+        for col, (_, r) in zip(cols, cards.iloc[i:i + 3].iterrows()):
+            with col:
+                with st.container(border=True):
+                    st.markdown(f"**{r['公司']}**")
+                    extra = f" · 暂停 {r['暂停']}" if r['暂停'] else ''
+                    st.caption(f"岗位 {r['岗位']} 个（在招 {r['在招']} · 完成 {r['完成']}{extra}）")
+                    m1, m2 = st.columns(2)
+                    m1.metric('需求 / 入职', f"{_fmt_num(r['需求'])} / {_fmt_num(r['入职'])}")
+                    m2.metric('缺口', _fmt_num(r['缺口']))
+                    tail = f"平均时长 {_fmt_num(r['平均时长'], 1)} 天 ｜ 简历→入职 {_fmt_pct(r['转化率'])}"
+                    if r['离职']:
+                        tail += f" ｜ 离职 {_fmt_num(r['离职'])} 人"
+                    st.caption(tail)
+
+
+def _dashboard_risks(d, ana, target_days):
+    """异常与风险清单：把表里对不上的地方自动列出来。"""
+    st.subheader('异常与风险清单')
+    rows = []
+    for _, r in ana.iterrows():
+        stt = r['状态']
+        msgs = []
+        if stt == '招聘中' and (r['周期(天)'] != r['周期(天)'] or _num(r['周期(天)'], 0) <= 0):
+            msgs.append('招聘中，但没填招聘起日期')
+        if stt == '招聘中' and _num(r['简历'], 0) <= 0:
+            msgs.append('招聘中，还没有收到简历')
+        if stt == '完成招聘' and _num(r['入职'], 0) <= 0:
+            msgs.append('已完成，但入职 0 人')
+        if _num(r['离职'], 0) > 0:
+            msgs.append(f"入职后离职 {_fmt_num(r['离职'])} 人")
+        if r['需求'] == r['需求'] and _num(r['现存'], 0) >= 0 and _num(r['现存'], 0) < _num(r['需求'], 0) \
+                and stt != '完成招聘':
+            msgs.append(f"现存 {_fmt_num(r['现存'])} 人 < 需求 {_fmt_num(r['需求'])} 人")
+        if stt == '暂停' and _num(r['简历'], 0) > 0:
+            msgs.append(f"已暂停，但已推送 {_fmt_num(r['简历'])} 份简历")
+        if stt == '招聘中' and _num(r['周期(天)'], 0) > target_days:
+            msgs.append(f"已招 {_fmt_num(r['周期(天)'])} 天，超过目标 {target_days:.0f} 天")
+        if msgs:
+            rows.append({'岗位': r['岗位'], '公司/部门': r['部门'], '状态': stt, '问题': '；'.join(msgs),
+                         '需求': r['需求'], '简历': r['简历'], '面试': r['面试'],
+                         '入职': r['入职'], '离职': r['离职'], '现存': r['现存']})
+    if not rows:
+        st.success('没有发现异常数据。')
+        return
+    risk = pd.DataFrame(rows)
+    st.caption(f'共 {len(risk)} 个岗位存在需要核对的地方（按状态看：'
+               + '、'.join(f'{k} {v}' for k, v in risk['状态'].value_counts().items()) + '）')
+    st.dataframe(risk, width='stretch', hide_index=True, height=min(140 + 36 * len(risk), 520))
+
+
 def page_dashboard():
     st.title('📊 招聘经营看板')
     st.caption('总览 · 时间趋势 · 组织结构 · 转化漏斗 · 周期分析 · 人员留存 · 岗位明细。'
@@ -1428,20 +1514,22 @@ def page_dashboard():
     target_days = float(target_days)
     ana = _position_analysis(d, target_days, float(slow_ratio))
     _save_snapshot(d)                                  # 每天第一次打开自动记一条快照
-    tabs = st.tabs(['📌 总览', '📈 时间趋势', '🏢 组织结构', '🔻 转化与周期', '👥 人员留存', '📋 岗位明细'])
+    tabs = st.tabs(['📌 招聘总览', '🏢 项目 / 公司', '📋 岗位明细', '🔻 转化与周期', '⚠️ 异常与风险', '👥 人员留存'])
     with tabs[0]:
         _dashboard_summary(d, ana, target_days)
-    with tabs[1]:
         _dashboard_monthly(d)
-    with tabs[2]:
+    with tabs[1]:
+        _dashboard_projects(d)
         _dashboard_progress(d, ana, target_days)
+    with tabs[2]:
+        _dashboard_detail(d, ana, only_risk, target_days)
+        _dashboard_export(d, ana, target_days)
     with tabs[3]:
         _dashboard_efficiency(d, ana, target_days)
     with tabs[4]:
-        _dashboard_retention(d, ana)
+        _dashboard_risks(d, ana, target_days)
     with tabs[5]:
-        _dashboard_detail(d, ana, only_risk, target_days)
-        _dashboard_export(d, ana, target_days)
+        _dashboard_retention(d, ana)
 
 
 # ==================== 岗位匹配：①岗位信息 → ②批量上传 → ③智能打分 ====================
@@ -1580,8 +1668,17 @@ def _jd_manage(positions):
     with st.expander('➕ 新增岗位（可粘贴 JD 自动解析）', expanded=False):
         name = st.text_input('岗位名称 *', key='jd_name', placeholder='如：电商运营管培生')
         dept = st.text_input('部门（可选）', key='jd_dept', placeholder='如：运营')
+        jd_up = st.file_uploader('或上传 JD 文件（PDF / Word / TXT）', type=['pdf', 'docx', 'txt'], key='jd_file')
+        jd_text = ''
+        if jd_up is not None:
+            try:
+                jd_text = mt.extract_text(jd_up.name, jd_up.getvalue())
+            except Exception as e:
+                st.caption(f'JD 文件解析失败：{e}')
         desc = st.text_area('岗位描述（粘贴 JD）', key='jd_desc', height=130,
                             placeholder='粘贴岗位描述，便于自动解析关键词…')
+        if jd_text and not (desc or '').strip():
+            desc = jd_text
 
         if st.button('🔍 自动解析描述', key='jd_parse'):
             kws = mt.parse_jd_keywords(desc)
@@ -1745,6 +1842,11 @@ def _build_run(pos, mode, rows, details):
     })
 
 
+def _grade(score):
+    s = _num(score, 0)
+    return 'A' if s >= 85 else ('B' if s >= 70 else ('C' if s >= 50 else 'D'))
+
+
 def render_run(run):
     """渲染某一条已保存的打分记录。"""
     rows = run.get('rows') or []
@@ -1754,6 +1856,10 @@ def render_run(run):
     res = pd.DataFrame(rows)
     if '匹配分' in res.columns:
         res = res.sort_values('匹配分', ascending=False).reset_index(drop=True)
+        res.insert(0, '等级', res['匹配分'].apply(_grade))
+    fu = run.get('followup') or {}
+    if fu:
+        res['跟进'] = res.get('姓名', pd.Series(dtype=str)).map(lambda n: fu.get(str(n), ''))
     res.insert(0, '排名', res.index + 1)
     st.caption(f"岗位：{run.get('position', '')} ｜ 打分方式：{run.get('mode', '')} ｜ 时间：{run.get('time', '')}")
 
@@ -1779,6 +1885,21 @@ def render_run(run):
                                      '排名': st.column_config.NumberColumn('排名')})
     else:
         st.dataframe(res, width='stretch', hide_index=True, height=380)
+
+    if '姓名' in res.columns:
+        with st.expander('跟进标记（已联系 / 已面试 / 已淘汰）', expanded=False):
+            names = [str(x) for x in res['姓名'].tolist()]
+            f1, f2, f3 = st.columns([2, 2, 1])
+            who = f1.multiselect('候选人', names, key=f"fu_who_{run.get('id')}")
+            stt = f2.selectbox('状态', ['未处理', '已联系', '已面试', '已淘汰'], key=f"fu_st_{run.get('id')}")
+            if f3.button('保存', key=f"fu_save_{run.get('id')}") and who:
+                fu2 = dict(run.get('followup') or {})
+                for n in who:
+                    fu2[n] = stt
+                run['followup'] = fu2
+                save_history([run if x.get('id') == run.get('id') else x for x in load_history()])
+                st.session_state['flash'] = '已保存跟进状态。'
+                st.rerun()
 
     details = run.get('details') or []
     det_rows = []
