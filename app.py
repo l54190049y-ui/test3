@@ -1407,10 +1407,20 @@ def _editable_table(src, key, extra_cols=None, height=360):
         return
     view = pd.DataFrame({'岗位': src['position'].astype(str), '部门': src['department'].astype(str)})
     for cn, en in EDIT_COLS:
-        view[cn] = src[en] if en in src.columns else None
+        if en not in src.columns:
+            view[cn] = None
+        elif en in du.DATE_COLS:
+            view[cn] = pd.to_datetime(src[en], errors='coerce')
+        elif en in du.NUMERIC_COLS or en == 'demand':
+            view[cn] = src[en] if en == 'demand' else pd.to_numeric(src[en], errors='coerce')
+        else:
+            view[cn] = src[en].astype(str)
     editable = ['岗位', '部门'] + [cn for cn, _ in EDIT_COLS]
     for cn, vals in (extra_cols or {}).items():
         view[cn] = list(vals)
+    for cn in view.columns:
+        if cn not in editable:
+            view[cn] = view[cn].astype(str)
     cfg = {'岗位': st.column_config.TextColumn('岗位'), '部门': st.column_config.TextColumn('部门')}
     for cn, en in EDIT_COLS:
         if en == 'status':
@@ -1424,7 +1434,7 @@ def _editable_table(src, key, extra_cols=None, height=360):
     try:
         edited = st.data_editor(view, key=key, num_rows='fixed', hide_index=True, height=height,
                                 column_config=cfg,
-                                disabled=[c for c in view.columns if c not in editable])
+                                disabled=[c for c in list(view.columns) if c not in editable])
     except Exception as e:
         st.caption(f'表格暂时不可编辑（{e}），已改为只读显示。')
         st.dataframe(view, width='stretch', hide_index=True, height=height)
