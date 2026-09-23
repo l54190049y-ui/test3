@@ -764,7 +764,8 @@ def _position_analysis(d, target_days, ratio):
         base = cat_med.get(r.get('category'))
         if base is None:
             base = med_all if med_all == med_all else float('nan')
-        std = base_by_cat.get(r.get('category'), fallback_base)
+        std = _type_baselines().get(str(r.get('category')),
+                                   base_by_cat.get(r.get('category'), fallback_base))
 
         issues, hints, score, flagged = [], [], 0, []
         if hiring and cycle == cycle and cycle > std:
@@ -831,6 +832,55 @@ def _position_analysis(d, target_days, ratio):
 
 def _health(level):
     return {'green': '🟢', 'amber': '🟡', 'red': '🔴'}.get(level, '⚪')
+
+
+def _type_baselines():
+    """手动设置的岗位类型基准周期（招聘类目 → 天）。"""
+    raw = kv_get('type_baseline_v1', {}) or {}
+    out = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            fv = _num(v)
+            if fv == fv and fv > 0:
+                out[str(k)] = fv
+    return out
+
+
+def _baseline_editor(d):
+    """岗位类型基准表：可以直接改基准周期并保存，保存后按新基准判断在招岗位。"""
+    manual = _type_baselines()
+    rows = []
+    for cat, g in d.groupby('category'):
+        gd = g[(g['status'] == '完成招聘') & g['duration_days'].notna() & (g['duration_days'] > 0)]
+        calc = _num(gd['duration_days'].median()) if len(gd) >= 1 else float('nan')
+        cur = manual.get(str(cat), calc if calc == calc else 30.0)
+        rows.append({'招聘类目': str(cat), '岗位数': int(len(g)),
+                     '在招': int((g['status'] == '招聘中').sum()), '已完成样本': int(len(gd)),
+                     '参考(同类中位)': round(calc, 1) if calc == calc else None,
+                     '基准周期(天)': round(float(cur), 1),
+                     '已完成的区间': (f"{_fmt_num(gd['duration_days'].min())}–{_fmt_num(gd['duration_days'].max())} 天"
+                                      if len(gd) else '—')})
+    tab = pd.DataFrame(rows).sort_values('岗位数', ascending=False)
+    st.markdown('**岗位类型基准**（同招聘类目在一起比；可直接改「基准周期」，改完保存）')
+    try:
+        edited = st.data_editor(
+            tab, key='edit_baseline', num_rows='fixed', hide_index=True, height=min(120 + 36 * len(tab), 380),
+            disabled=['招聘类目', '岗位数', '在招', '已完成样本', '参考(同类中位)', '已完成的区间'],
+            column_config={'基准周期(天)': st.column_config.NumberColumn('基准周期(天)', min_value=1, max_value=365,
+                                                                        format='%.0f', help='这一类岗位的目标招聘天数')})
+    except Exception as e:
+        st.caption(f'基准表暂时不可编辑（{e}）')
+        st.dataframe(tab, width='stretch', hide_index=True)
+        return
+    if st.button('💾 保存基准周期', key='edit_baseline_save'):
+        vals = {}
+        for _, r in edited.iterrows():
+            v = _num(r['基准周期(天)'])
+            if v == v and v > 0:
+                vals[str(r['招聘类目'])] = float(v)
+        kv_set('type_baseline_v1', vals)
+        st.session_state['flash'] = f'已保存 {len(vals)} 个类型的基准周期，在招岗位的距离已按新基准重算。'
+        st.rerun()
 
 
 def _headline_metrics(d):
@@ -993,17 +1043,7 @@ def _dashboard_summary(d, ana, target_days):
     c2[3].metric('简历→入职转化', _fmt_pct(conv) if conv == conv else '—',
                  f"收到 {_fmt_num(m['简历'])} 份简历", delta_color='off')
 
-    st.markdown('**岗位类型基准**（同招聘类目的周期参考，来自该类已完成岗位）')
-    type_rows = []
-    for cat, g in d.groupby('category'):
-        gd = g[(g['status'] == '完成招聘') & g['duration_days'].notna() & (g['duration_days'] > 0)]
-        std = _num(gd['duration_days'].median()) if len(gd) >= 1 else _num(ana['基准(天)'].median())
-        type_rows.append({
-            '招聘类目': cat, '岗位数': int(len(g)), '在招': int((g['status'] == '招聘中').sum()),
-            '已完成': int(len(gd)), '基准周期(中位)': round(std, 1) if std == std else None,
-            '已完成的区间': (f"{_fmt_num(gd['duration_days'].min())}–{_fmt_num(gd['duration_days'].max())} 天"
-                             if len(gd) else '—')})
-    st.dataframe(pd.DataFrame(type_rows), width='stretch', hide_index=True)
+    _baseline_editor(d)
 
     st.markdown('**在招岗位进度**（灰段 = 距同类基准还剩多少天）')
     if op.empty:
