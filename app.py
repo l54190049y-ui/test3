@@ -724,6 +724,15 @@ def _position_analysis(d, target_days, ratio):
             m = _num(g['duration_days'].dropna().median())
             if m == m:
                 cat_med[cat] = m
+    # 同类岗位（同招聘类目）的周期基准：优先用该类目已完成岗位的中位数，样本太少才退回整体中位/目标值
+    base_by_cat = {}
+    for cat, g in (done.groupby('category') if not done.empty else []):
+        gv = g['duration_days'].dropna()
+        if len(gv) >= 1:
+            mm = _num(gv.median())
+            if mm == mm:
+                base_by_cat[cat] = mm
+    fallback_base = med_all if med_all == med_all else float(target_days)
 
     records = []
     for _, r in d.iterrows():
@@ -755,17 +764,17 @@ def _position_analysis(d, target_days, ratio):
         base = cat_med.get(r.get('category'))
         if base is None:
             base = med_all if med_all == med_all else float('nan')
+        std = base_by_cat.get(r.get('category'), fallback_base)
 
         issues, hints, score, flagged = [], [], 0, []
-        if hiring and cycle == cycle and cycle > target_days:
-            issues.append(f'在招 {cycle:.0f} 天，已超过目标周期 {target_days:.0f} 天')
+        if hiring and cycle == cycle and cycle > std:
+            issues.append(f'在招 {cycle:.0f} 天，已超过同类基准 {std:.0f} 天')
             hints.append('先判断是“没人投”还是“投了筛不出来”：看简历量、面试转化和用人部门反馈')
             score += 3
         if (not hiring) and status in ('完成招聘', '暂停') and cycle == cycle:
-            slow_abs = cycle > target_days
-            slow_rel = base == base and cycle > base * ratio and cycle > base + 5
-            if slow_abs or slow_rel:
-                cmp = f'（目标 {target_days:.0f} 天' + (f'，同类中位 {base:.0f} 天）' if base == base else '）')
+            slow_rel = cycle > std * ratio and cycle > std + 3
+            if slow_rel:
+                cmp = f'（同类基准 {std:.0f} 天）'
                 issues.append(f'招聘周期 {cycle:.0f} 天偏长{cmp}')
                 hints.append('复盘时间花在哪一环：简历不足、面试排期、还是决策慢')
                 score += 2
@@ -804,6 +813,7 @@ def _position_analysis(d, target_days, ratio):
             '周期(天)': round(cycle, 1) if cycle == cycle else float('nan'),
             '目标(天)': float(target_days),
             '同类中位(天)': round(base, 1) if base == base else float('nan'),
+            '基准(天)': round(std, 1),
             '需求': demand_max, '简历': resumes, '面试': interviewed, 'Offer': offer, '入职': onboarded,
             '通过': passed, '离职': left, '现存': _num(r.get('current_headcount')),
             '招聘起': r.get('start_date'), '招聘止': r.get('end_date'),
@@ -918,9 +928,10 @@ def _open_issues(r, target_days):
     if str(r.get('状态', '')) != '招聘中':
         return []
     out = []
+    std = _num(r.get('基准(天)', target_days), target_days)
     days = _num(r['周期(天)'])
-    if days == days and days > target_days:
-        out.append(f'已超目标 {days - target_days:.0f} 天')
+    if days == days and days > std:
+        out.append(f'已超同类基准 {days - std:.0f} 天')
     res, itv = _num(r['简历'], 0), _num(r['面试'], 0)
     if res <= 0:
         out.append('尚未收到简历')
@@ -982,7 +993,19 @@ def _dashboard_summary(d, ana, target_days):
     c2[3].metric('简历→入职转化', _fmt_pct(conv) if conv == conv else '—',
                  f"收到 {_fmt_num(m['简历'])} 份简历", delta_color='off')
 
-    st.markdown('**在招岗位进度**（灰段 = 到目标周期还剩多少天）')
+    st.markdown('**岗位类型基准**（同招聘类目的周期参考，来自该类已完成岗位）')
+    type_rows = []
+    for cat, g in d.groupby('category'):
+        gd = g[(g['status'] == '完成招聘') & g['duration_days'].notna() & (g['duration_days'] > 0)]
+        std = _num(gd['duration_days'].median()) if len(gd) >= 1 else _num(ana['基准(天)'].median())
+        type_rows.append({
+            '招聘类目': cat, '岗位数': int(len(g)), '在招': int((g['status'] == '招聘中').sum()),
+            '已完成': int(len(gd)), '基准周期(中位)': round(std, 1) if std == std else None,
+            '已完成的区间': (f"{_fmt_num(gd['duration_days'].min())}–{_fmt_num(gd['duration_days'].max())} 天"
+                             if len(gd) else '—')})
+    st.dataframe(pd.DataFrame(type_rows), width='stretch', hide_index=True)
+
+    st.markdown('**在招岗位进度**（灰段 = 距同类基准还剩多少天）')
     if op.empty:
         st.success('当前没有在招岗位。')
     else:
@@ -1022,9 +1045,11 @@ def _dashboard_summary(d, ana, target_days):
         opx['缺口'] = opx.apply(
             lambda r: max(_num(r['需求'], 0) - _num(r['入职'], 0), 0) if r['需求'] == r['需求'] else float('nan'),
             axis=1)
-        merged = src_open.merge(opx[['_k', '周期(天)', '目标(天)', '缺口', '标注']], on='_k', how='left')
+        opx['距离(天)'] = opx['基准(天)'] - opx['周期(天)']
+        merged = src_open.merge(opx[['_k', '周期(天)', '基准(天)', '距离(天)', '缺口', '标注']], on='_k', how='left')
         _editable_table(merged, key='edit_open',
-                        extra_cols={'已招天数': merged['周期(天)'], '目标天数': merged['目标(天)'],
+                        extra_cols={'类目': merged['category'], '已招天数': merged['周期(天)'],
+                                    '同类基准': merged['基准(天)'], '距离(天)': merged['距离(天)'],
                                     '缺口': merged['缺口'], '标注': merged['标注'].fillna('')})
         st.caption(f'在招 {len(op)} 个：超期 {overdue} 个、待跟进 {flagged} 个。'
                    '表格可以直接改（状态/招聘起/招聘止/需求/简历/面试/通过/Offer/入职/离职/现存），'
