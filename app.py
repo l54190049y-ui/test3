@@ -964,8 +964,13 @@ def _dashboard_summary(d, ana, target_days):
                  (f'超期 {overdue} · 待跟进 {flagged}' if flagged else '进度正常'),
                  delta_color='inverse' if flagged else 'off')
     c1[2].metric('总需求人数', f"{_fmt_num(m['需求'])} 人", f'缺口 {_fmt_num(gap)} 人', delta_color='off')
-    c1[3].metric('平均招聘时长', f'{_fmt_num(cyc, 1)} 天',
-                 _delta_txt(dv, '平均周期', ' 天', 1) or f'目标 {target_days:.0f} 天', delta_color='inverse')
+    done_all = ana[ana['状态'] == '完成招聘']
+    ok_mask = done_all['周期(天)'] == done_all['周期(天)']
+    slow_mask = ok_mask & (done_all['周期(天)'] > target_days) & \
+        (done_all['周期(天)'] > done_all['同类中位(天)'] * 1.2)
+    slow_n = int(slow_mask.sum())
+    c1[3].metric(f'{_health(lv_open)} 周期偏长岗位', f'{slow_n} 个',
+                 f'按岗位对标（目标 {target_days:.0f} 天 / 同类中位）', delta_color='inverse' if slow_n else 'off')
 
     c2 = st.columns(4)
     c2[0].metric('总入职人数', f"{_fmt_num(m['入职'])} 人",
@@ -1027,7 +1032,7 @@ def _dashboard_summary(d, ana, target_days):
 
 
 def _dashboard_monthly(d):
-    """二、时间趋势：按月看新增岗位、完成岗位与完成岗位的平均周期。"""
+    """按月看新增岗位与完成岗位（周期不做跨岗位平均，放到「转化与周期」里按岗位看）。"""
     st.subheader('按月趋势')
     tmp = d.copy()
     tmp['开始月'] = pd.to_datetime(tmp['start_date'], errors='coerce').dt.to_period('M')
@@ -1047,7 +1052,6 @@ def _dashboard_monthly(d):
     hist = pd.DataFrame({'月份': months})
     hist['新增岗位'] = hist['月份'].map({str(k): v for k, v in new.items()}).fillna(0).astype(int)
     hist['完成岗位'] = hist['月份'].map({str(k): v for k, v in done_cnt.items()}).fillna(0).astype(int)
-    hist['完成岗位平均周期'] = hist['月份'].map({str(k): v for k, v in done_cyc.items()}).round(1)
     hist['新增名单'] = hist['月份'].map({str(k): v for k, v in new_names.items()}).fillna('—')
     hist['完成名单'] = hist['月份'].map({str(k): v for k, v in done_names.items()}).fillna('—')
 
@@ -1058,18 +1062,14 @@ def _dashboard_monthly(d):
     fig.add_trace(go.Bar(x=hist['月份'], y=hist['完成岗位'], name='完成岗位（按招聘止）', marker_color='#2e9e6b',
                          customdata=hist[['完成名单']].values,
                          hovertemplate='<b>%{x} 完成 %{y} 个岗位</b><br>%{customdata[0]}<extra></extra>'))
-    fig.add_trace(go.Scatter(x=hist['月份'], y=hist['完成岗位平均周期'], name='完成岗位平均周期(天)',
-                             yaxis='y2', mode='lines+markers', line=dict(color='#e07b39', width=3),
-                             customdata=hist[['完成名单']].values,
-                             hovertemplate='<b>%{x}</b><br>完成岗位平均 %{y:.1f} 天'
-                                           '<br>%{customdata[0]}<extra></extra>'))
     fig.update_layout(barmode='group', height=360, margin=dict(t=30, b=10, l=10, r=10),
-                      yaxis=dict(title='岗位数'), yaxis2=dict(title='天', overlaying='y', side='right'),
+                      yaxis=dict(title='岗位数'),
                       legend=dict(orientation='h', y=1.15),
                       paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
     st.plotly_chart(fig, width='stretch')
     st.dataframe(hist, width='stretch', hide_index=True)
-    st.caption('「新增岗位」按招聘起算，「完成岗位」按招聘止算；平均周期只统计完成招聘的岗位。')
+    st.caption('「新增岗位」按招聘起算，「完成岗位」按招聘止算。周期不在这里做平均——各岗位周期不同，'
+               '要看去「转化与周期」里按岗位看。')
 
 
 def _dashboard_progress(d, ana, target_days):
@@ -1211,56 +1211,28 @@ def _dashboard_efficiency(d, ana, target_days):
     if done.empty:
         st.info('暂无已完成岗位的周期数据。')
         return
-    c3, c4 = st.columns(2)
-    with c3:
-        st.markdown('**周期分布（每个点=1 个完成岗位）**')
-        bins = pd.cut(done['周期(天)'], bins=min(8, max(3, done['周期(天)'].nunique())), include_lowest=True)
-        grp = done.groupby(bins, observed=True)
-        labels = [f'{int(iv.left)}–{int(iv.right)} 天' for iv in grp.size().index]
-        counts = grp.size().values
-        bin_names = ['、'.join(str(x) for x in g['岗位']) for _, g in grp]
-        avg = _num(done['周期(天)'].mean())
-        med = _num(done['周期(天)'].median())
-        hist_fig = go.Figure(go.Bar(x=labels, y=counts, customdata=[[n] for n in bin_names],
-                                    marker_color='#4c8bf5',
-                                    hovertemplate='<b>%{x}</b><br>%{y} 个岗位<br>%{customdata[0]}<extra></extra>'))
-        if avg == avg:
-            hist_fig.add_vline(x=avg, line_dash='dot', line_color='#e07b39', annotation_text=f'平均 {avg:.1f} 天')
-        if med == med:
-            hist_fig.add_vline(x=med, line_dash='dash', line_color='#2e9e6b', annotation_text=f'中位 {med:.0f} 天')
-        hist_fig.update_layout(height=320, margin=dict(t=30, b=10, l=10, r=10), xaxis_title='周期',
-                               yaxis_title='岗位数',
-                               paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
-        st.plotly_chart(hist_fig, width='stretch')
-    with c4:
-        st.markdown('**各公司平均周期**')
-        bydept = done.groupby('部门').agg(完成岗位=('岗位', 'count'), 平均周期=('周期(天)', 'mean')).reset_index()
-        bydept['平均周期'] = bydept['平均周期'].round(1)
-        dept_names = done.groupby('部门')['岗位'].apply(lambda s: '、'.join(str(x) for x in s)).to_dict()
-        bydept['岗位名单'] = bydept['部门'].map(dept_names).fillna('—')
-        bar = px.bar(bydept.sort_values('平均周期'), x='平均周期', y='部门', orientation='h',
-                     text='平均周期', color='平均周期', color_continuous_scale='YlOrRd',
-                     custom_data=['岗位名单', '完成岗位'])
-        bar.update_traces(hovertemplate='<b>%{y}</b><br>平均 %{x:.1f} 天 · 完成 %{customdata[1]} 个岗位'
-                                        '<br>%{customdata[0]}<extra></extra>')
-        bar.update_layout(height=320, margin=dict(t=30, b=10, l=10, r=10), showlegend=False,
-                          coloraxis_showscale=False,
-                          paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
-        st.plotly_chart(bar, width='stretch')
+    cmp = done[['岗位', '类目', '部门', '周期(天)', '同类中位(天)', '目标(天)', '需求', '入职']].copy()
+    cmp['对标结果'] = cmp.apply(
+        lambda r: ('偏长' if (r['周期(天)'] > r['目标(天)']) or
+                   (r['同类中位(天)'] == r['同类中位(天)'] and r['周期(天)'] > r['同类中位(天)'] * 1.2)
+                   else '正常'), axis=1)
+    cmp = cmp.sort_values('周期(天)', ascending=False)
+    st.markdown('**每个岗位的周期 vs 自己的目标 / 同类中位**')
+    st.dataframe(cmp, width='stretch', hide_index=True, height=min(140 + 34 * len(cmp), 420))
 
-    st.markdown('**每个已完成岗位的周期**')
     cyc = done.sort_values('周期(天)', ascending=True)
-    bar2 = px.bar(cyc, x='周期(天)', y='岗位', orientation='h', text='周期(天)', color='部门',
-                  custom_data=['部门', '需求', '入职', '简历', '面试'])
-    bar2.update_traces(hovertemplate='<b>%{y}</b>（%{customdata[0]}）<br>周期 %{x:.0f} 天'
-                                     '<br>需求 %{customdata[1]} · 入职 %{customdata[2]}'
-                                     '<br>简历 %{customdata[3]} · 面试 %{customdata[4]}<extra></extra>')
+    bar2 = px.bar(cyc, x='周期(天)', y='岗位', orientation='h', text='周期(天)', color='类目',
+                  custom_data=['类目', '同类中位(天)', '部门', '需求', '入职'])
+    bar2.update_traces(hovertemplate='<b>%{y}</b>（%{customdata[2]}）<br>周期 %{x:.0f} 天'
+                                     '<br>类目 %{customdata[0]} · 同类中位 %{customdata[1]} 天'
+                                     '<br>需求 %{customdata[3]} · 入职 %{customdata[4]}<extra></extra>')
     bar2.add_vline(x=target_days, line_dash='dash', line_color='#888',
                    annotation_text=f'目标 {target_days:.0f} 天', annotation_position='top')
     bar2.update_layout(height=380, margin=dict(t=30, b=10, l=10, r=10), legend_title_text='',
                        paper_bgcolor='rgba(0,0,0,0)', font=dict(family='Microsoft YaHei, sans-serif'))
     st.plotly_chart(bar2, width='stretch')
-    st.caption('统计范围：已完成招聘的岗位；颜色按公司区分。')
+    st.caption('每个岗位跟自己的目标周期、以及同类岗位（同招聘类目）的中位周期对比，不做跨岗位平均。'
+               '颜色按招聘类目区分。')
 
 
 def _dashboard_retention(d, ana):
@@ -1492,7 +1464,7 @@ def _dashboard_projects(d):
                     m1, m2 = st.columns(2)
                     m1.metric('需求 / 入职', f"{_fmt_num(r['需求'])} / {_fmt_num(r['入职'])}")
                     m2.metric('缺口', _fmt_num(r['缺口']))
-                    tail = f"平均时长 {_fmt_num(r['平均时长'], 1)} 天 ｜ 简历→入职 {_fmt_pct(r['转化率'])}"
+                    tail = f"简历→入职 {_fmt_pct(r['转化率'])}"
                     if r['离职']:
                         tail += f" ｜ 离职 {_fmt_num(r['离职'])} 人"
                     st.caption(tail)
